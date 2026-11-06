@@ -1,143 +1,80 @@
-# Telegram Channel Backup ULP
+# TELE-SUITE v2.0 — Hệ Thống Web Quản Lý Đa Tài Khoản, Backup Toàn Diện & Auto-Messaging (A–Z)
 
-Tool nay gom 3 che do:
+Bộ công cụ Web Panel hoàn chỉnh (FastAPI + Telethon Async + React + SQLite WAL) hỗ trợ:
 
-- `python -m tele_backup login`: dang nhap user session Telethon
-- `python -m tele_backup sync`: chay backup one-shot cho tat ca source enabled
-- `python main.py`: chay daemon 24/7, nghe tin nhan moi va nhan lenh quan tri qua bot Telegram neu co config
+1. **Bảo mật Web Panel bằng SHA-256:**
+   - Mật khẩu quản trị được băm SHA-256 và cấu hình qua biến `WEB_ADMIN_PASSWORD_SHA256` trong `.env`.
+   - Khi đăng nhập trên Web, bạn có thể nhập mật khẩu gốc (server tự băm SHA-256 và đối chiếu bằng `hmac.compare_digest`) hoặc dán trực tiếp chuỗi SHA-256.
+2. **Quản lý Đa Tài Khoản (Multi-Account):**
+   - Thêm không giới hạn tài khoản Telegram.
+   - Đăng nhập trực tiếp trên Web Panel (Gửi mã OTP $\rightarrow$ Nhập OTP $\rightarrow$ Nhập mật khẩu 2FA nếu có) hoặc tải lên file `.session` sẵn có.
+   - Hỗ trợ cấu hình Proxy riêng (`socks5://...`, `http://...`) cho từng tài khoản.
+   - Tính năng **Quét Nhóm & Rule Tự Động**: Tự động lấy danh sách Group/Supergroup/Forum/Channel và tự động đọc `ChatBannedRights` + `noforwards`.
+3. **Hệ thống Backup Mở Rộng Toàn Diện:**
+   - Chỉ định tài khoản đọc nguồn (`reader_account_id`) và tài khoản đẩy đích (`sender_account_id`).
+   - Hỗ trợ lọc theo loại nội dung: **Tài liệu/File** (theo đuôi `.txt`, `.zip`, `.rar` hoặc mọi đuôi), **Hình ảnh**, **Video**, **Văn bản (Text)**, **Sticker**, **Voice/Audio**.
+   - Định tuyến thông minh: Đẩy file nén (`.zip`, `.rar`, `.7z`) vào Topic Archive riêng, các nội dung khác vào Topic Mặc định.
+   - Hỗ trợ lọc từ khóa bắt buộc / từ khóa loại trừ, tùy chỉnh chế độ Caption, chống trùng lặp bằng `file_fingerprints`.
+   - **Protected Content Fallback:** Tự động tải tạm về máy và Re-upload lên nhóm đích khi nhóm nguồn bật chế độ chống sao chép/chuyển tiếp (`noforwards`).
+4. **Hệ thống Auto-Messaging, Folder Gom Nhóm & Hybrid Rule Fallback (Hướng 3):**
+   - **Folder Gom Nhóm:** Gom nhiều nhóm vào 1 Folder (VD: *Folder Nhóm Mua Bán*, *Folder Nhóm Cộng Đồng*).
+   - **Kịch bản Đa bước (Scenarios):** Hỗ trợ gửi Text, Ảnh/Video/File, Sticker, hoặc Forward tin nhắn từ kênh mẫu theo chu kỳ lặp lại (`interval` + `jitter` ngẫu nhiên chống spam).
+   - **Phân phối linh hoạt:** Gán kịch bản cho cả Folder hoặc chỉ định riêng từng nhóm gửi nội dung ghi đè (`override_text_content`).
+   - **Hybrid Rule & Fallback Engine (Hướng 3):**
+     - **Lớp 1 (Pre-Send Transform):** Tự động kiểm tra quy tắc của nhóm trong SQLite (`no_links`, `no_stickers`, `no_forwards`, `no_media`, `no_bot_mentions`, `banned_words`) để biến đổi tin nhắn (Đổi Forward $\rightarrow$ Copy nội dung; xóa hoặc che link `domain[.]com` hoặc dùng `fallback_no_link_text`; xóa `@bot`; đổi Sticker/Media sang `fallback_text`).
+     - **Lớp 2 (Runtime Auto-Learn & Retry):** Nếu khi gửi thực tế bị Telegram từ chối (VD: `CHAT_SEND_STICKERS_FORBIDDEN`, `CHAT_FORWARDS_RESTRICTED`), hệ thống tự động lưu cờ cấm vào SQLite (`auto_learned = 1`) và lập tức gửi lại bằng phương án dự phòng!
 
-## Thay doi so voi ban dau
+---
 
-- Khong con mac dinh dung o `200` message. `SYNC_LIMIT` de trong se backup het backlog.
-- Ho tro nhieu source cung luc thong qua bang `sources` trong SQLite.
-- Ho tro daemon 24/7: startup catch-up, sau do nghe message moi va dong bo ngay.
-- Ho tro manager bot de login session, them/bot source, doi destination, bat/tat source, trigger sync.
-- Neu source bat `Protected Content`, Telegram khong cho resend media reference. Tool nay ho tro fallback download/re-upload rieng cho tung source neu ban bat `ALLOW_PROTECTED_FALLBACK` hoac `/setprotected`.
+## Cài Đặt & Khởi Chạy
 
-## Yeu cau
-
-- Python 3.12+
-- `api_id` va `api_hash` tu `https://my.telegram.org`
-- Neu dung manager bot thi can bot token va `ADMIN_USER_IDS`
-
-## Cai dat
+### 1. Cài đặt thư viện Backend & Build Frontend
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
+
+cd frontend
+npm install
+npm run build
+cd ..
 ```
 
-## Cau hinh `.env`
+### 2. Cấu hình `.env`
+
+Tạo mã SHA-256 cho mật khẩu của bạn (ví dụ bằng PowerShell hoặc trong mục **Cài đặt** của Web Panel):
+
+```powershell
+python -c "import hashlib; print(hashlib.sha256(b'mat_khau_cua_ban').hexdigest())"
+```
+
+Cập nhật vào `.env`:
 
 ```dotenv
-TG_API_ID=123456
-TG_API_HASH=your_hash
-TG_PHONE=+84xxxxxxxxx
-MANAGER_BOT_TOKEN=
-ADMIN_USER_IDS=123456789
-DB_PATH=./data/state.sqlite
-SESSION_PATH=./data/user.session
-MANAGER_BOT_SESSION_PATH=./data/manager_bot.session
-LOG_PATH=./data/logs/sync.log
-TEMP_DIR=./data/temp
-SEND_DELAY_MIN_MS=800
-SEND_DELAY_MAX_MS=1500
-SYNC_LIMIT=
-LIVE_RECONCILE_SECONDS=120
+# Mặc định mẫu bên dưới là SHA-256 của "admin123"
+WEB_ADMIN_PASSWORD_SHA256=240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9
+WEB_SESSION_SECRET=change-this-secret-key-for-hmac-token-signing
 
-# Optional legacy bootstrap source
-SOURCE_CHAT_ID=3488087171
-DEST_CHAT_ID=-1001878033586
-DEST_TOPIC_DEFAULT=2085
-DEST_TOPIC_ARCHIVE=2088
-SOURCE_LABEL=ulp
-ALLOW_PROTECTED_FALLBACK=false
+WEB_HOST=127.0.0.1
+WEB_PORT=8000
+
+DEFAULT_TG_API_ID=123456
+DEFAULT_TG_API_HASH=your_api_hash
 ```
 
-Giai thich nhanh:
-
-- `SYNC_LIMIT=` de trong: one-shot sync se backup het backlog
-- `ADMIN_USER_IDS`: danh sach Telegram user id duoc phep quan tri bot, cach nhau boi dau phay
-- `SOURCE_*`: chi dung de bootstrap source dau tien. Sau do co the quan tri them/bot bang bot command
-- `ALLOW_PROTECTED_FALLBACK=true`: cho phep source protected dung download/re-upload fallback
-
-## Dang nhap user session
-
-```powershell
-python -m tele_backup login
-```
-
-Hoac neu da config manager bot va `ADMIN_USER_IDS`, co the login tu xa:
-
-```text
-/login
-/code 12345
-/password your_2fa_password
-```
-
-## One-shot sync
-
-```powershell
-python -m tele_backup sync
-python -m tele_backup sync --source-chat-id 3488087171
-python -m tele_backup sync --limit 100
-```
-
-## Chay daemon 24/7
+### 3. Khởi chạy Hệ thống
 
 ```powershell
 python main.py
 ```
 
-Daemon se:
+Sau đó mở trình duyệt tại: **`http://127.0.0.1:8000`**
 
-- bootstrap source legacy tu `.env` neu co
-- startup catch-up toan bo backlog cua cac source enabled
-- lang nghe message moi va xu ly ngay
-- chay reconcile dinh ky de bat hut message neu bi reconnect
-- khoi dong manager bot neu `MANAGER_BOT_TOKEN` duoc set
+---
 
-## Manager bot commands
+## Kiểm Thử (Unit & Integration Tests)
 
-Luon co:
-
-- `/whoami`
-- `/help`
-
-Can nam trong `ADMIN_USER_IDS`:
-
-- `/status`
-- `/sources`
-- `/login [phone]`
-- `/code <otp_code>`
-- `/password <twofa_password>`
-- `/logout`
-- `/addsource <source_chat_id> <dest_chat_id> <topic_default> <topic_archive> [protected_fallback 0|1] [label...]`
-- `/setdest <source_chat_id> <dest_chat_id> <topic_default> <topic_archive>`
-- `/setlabel <source_chat_id> <label...>`
-- `/setprotected <source_chat_id> <0|1>`
-- `/enable <source_chat_id>`
-- `/disable <source_chat_id>`
-- `/remove <source_chat_id>`
-- `/syncall [limit]`
-- `/sync <source_chat_id> [limit]`
-
-## Cach routing file
-
-- `.txt` -> `dest_topic_default`, bo caption, dedupe theo `document_id:size:normalized_filename`
-- `.zip`, `.rar` -> `dest_topic_archive`, giu nguyen caption
-- document khac -> `dest_topic_default`
-- text-only, photo, video, sticker, voice, service message -> bo qua
-
-## Gioi han ky thuat
-
-- Source protected/no-forwards khong the server-side copy. Fallback download/re-upload la cach kha thi duy nhat.
-- Dedupe `.txt` van la best-effort theo metadata, khong hash noi dung file.
-- Tinh doc lap cua backup duoc dam bao boi viec tao message moi o destination, khong dung `forward_messages`.
-
-## Bao mat
-
-- Khong commit `.env`, `.session`, database, log, temp file.
-- Neu bot token da tung bi lo, hay regenerate token trong BotFather.
+```powershell
+python -m pytest -v
+python -m ruff check backend tests main.py
+```

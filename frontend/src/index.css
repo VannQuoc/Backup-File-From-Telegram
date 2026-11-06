@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #10B981;
+  --color-primary-hover: #059669;
+  --color-secondary: #F59E0B;
+  --color-surface: #121215;
+  --color-surface-elevated: #18181C;
+  --color-border-subtle: #27272A;
+  --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+}
+
+@layer base {
+  body {
+    background-color: #09090B;
+    color: #F4F4F5;
+    font-family: var(--font-sans);
+  }
+
+  input, select, textarea {
+    background-color: #09090B;
+    border: 1px solid #27272A;
+    color: #F4F4F5;
+    border-radius: 2px;
+  }
+
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: #10B981;
+  }
+}
+
