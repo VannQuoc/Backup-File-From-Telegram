@@ -809,4 +809,111 @@ async def test_health_check_relogin_and_smart_antispam_and_bulk_invite(
     assert bulk_res["manual_join_links"][0]["join_link"] == "https://t.me/nhom_cam_moi"
 
 
+@pytest.mark.asyncio
+async def test_multi_hop_spam_cascade_and_nonblocking_run_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backend.telegram.client_pool import TelegramClientPool
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "data" / "state_cascade.sqlite"))
+    cfg = load_config()
+    store = DatabaseStore(cfg.db_path)
+    pool = TelegramClientPool(store, cfg)
+
+    acc1 = store.create_account(
+        AccountCreateRequest(label="Nick 1 Dính SpamBot", phone="+84901000001"),
+        cfg.sessions_dir,
+    )
+    acc2 = store.create_account(
+        AccountCreateRequest(label="Nick 2 Bị Mute Nhóm", phone="+84901000002"),
+        cfg.sessions_dir,
+    )
+    acc3 = store.create_account(
+        AccountCreateRequest(label="Nick 3 Khỏe Mạnh", phone="+84901000003"),
+        cfg.sessions_dir,
+    )
+    for a in (acc1, acc2, acc3):
+        store.update_account_status(a["id"], "connected")
+
+    store.upsert_chat_group(
+        ChatGroupUpsertRequest(
+            chat_id=-100999888,
+            title="Nhóm Cộng Đồng Lớn",
+            username="congdong_lon_vn",
+        )
+    )
+
+    class SpamReportedClient:
+        async def send_message(self, **kwargs: Any) -> Any:
+            raise RuntimeError("Too many requests (caused by SendMessageRequest)")
+
+    class ChatMutedClient:
+        async def send_message(self, **kwargs: Any) -> Any:
+            raise RuntimeError("You can't write in this chat (caused by SendMessageRequest)")
+
+    class UncachedEntityHealthyClient:
+        def __init__(self) -> None:
+            self.entities_used: list[Any] = []
+
+        async def get_input_entity(self, peer: Any) -> Any:
+            return f"resolved:{peer}"
+
+        async def send_message(self, **kwargs: Any) -> Any:
+            entity = kwargs.get("entity")
+            self.entities_used.append(entity)
+            if str(entity).lstrip("-").isdigit():
+                raise ValueError(f"Could not find the input entity for PeerChannel({entity})")
+            return type("SentMsg", (), {"id": 5555})()
+
+    healthy_c3 = UncachedEntityHealthyClient()
+    clients_map = {
+        acc1["id"]: SpamReportedClient(),
+        acc2["id"]: ChatMutedClient(),
+        acc3["id"]: healthy_c3,
+    }
+
+    async def fake_get_auth_client(account_id: int) -> Any:
+        return clients_map.get(account_id)
+
+    monkeypatch.setattr(pool, "get_authorized_client", fake_get_auth_client)
+
+    # Even when scenario explicitly pins `sender_account_id = acc1["id"]`,
+    # it MUST cascade: Acc #1 (Spam) -> Acc #2 (Chat Muted) -> Acc #3 (@username resolve -> Success)!
+    sc = store.create_scenario(
+        ScenarioCreateRequest(
+            name="Kịch Bản Cascade 3 Tầng",
+            sender_account_id=acc1["id"],
+            steps=[
+                ScenarioStepInput(
+                    step_order=1,
+                    name="Bước 1",
+                    action_type="send_text",
+                    text_content="Tin nhắn chào sân {account_name}",
+                )
+            ],
+            targets=[ScenarioTargetInput(target_type="chat", target_id=-100999888)],
+        )
+    )
+
+    auto_sender = AutoSenderEngine(store, pool, cfg)
+    logs = await auto_sender.run_scenario_now(sc["id"])
+    assert len(logs) == 1
+    assert logs[0]["status"] == "success"
+    assert logs[0]["account_id"] == acc3["id"]
+    assert logs[0]["fallback_applied"] is True
+    assert "resolved:@congdong_lon_vn" in healthy_c3.entities_used
+
+    # Verify Acc #1 is globally quarantined (`flood_wait`) and Acc #2 is marked `can_send_messages=False`
+    assert store.get_account(acc1["id"])["status"] == "flood_wait"
+    picked_next = await pool.pick_any_authorized_client(
+        preferred_account_id=acc1["id"],
+        target_chat_id=-100999888,
+    )
+    # Must immediately pick Acc #3, skipping quarantined Acc #1 AND muted Acc #2!
+    assert picked_next is not None
+    assert picked_next[0] == acc3["id"]
+    store.close()
+
+
+
 

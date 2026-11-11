@@ -67,8 +67,8 @@ def create_app(
         try:
             yield
         finally:
+            await auto_sender.stop()
             if start_background_workers:
-                await auto_sender.stop()
                 await backup_engine.stop()
                 await pool.disconnect_all()
             store.close()

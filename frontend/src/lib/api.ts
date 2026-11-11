@@ -11,6 +11,7 @@ import type {
   MediaLibraryItem,
   RecentChatMessage,
   Scenario,
+  ScenarioLiveRun,
   ScenarioPreflightMatrix,
   ScenarioStep,
   SyncStateItem,
@@ -398,11 +399,18 @@ export const api = {
     }),
   deleteScenario: (id: number) =>
     apiFetch<{ deleted: boolean }>(`/api/scenarios/${id}`, { method: 'DELETE' }),
-  runScenarioNow: (id: number) =>
-    apiFetch<{ scenario_id: number; executed_count: number; logs: ExecutionLog[] }>(
-      `/api/scenarios/${id}/run`,
-      { method: 'POST' },
-    ),
+  runScenarioNow: (id: number, wait = false) =>
+    apiFetch<{
+      scenario_id: number;
+      status?: string;
+      background?: boolean;
+      total_destinations?: number;
+      executed_count: number;
+      live_run?: ScenarioLiveRun;
+      logs: ExecutionLog[];
+    }>(`/api/scenarios/${id}/run${wait ? '?wait=true' : ''}`, { method: 'POST' }),
+  getScenarioRunStatus: (id: number) =>
+    apiFetch<ScenarioLiveRun>(`/api/scenarios/${id}/run-status`),
   cloneScenario: (id: number) =>
     apiFetch<Scenario>(`/api/scenarios/${id}/clone`, { method: 'POST' }),
   preflightCheckScenario: (id: number) =>

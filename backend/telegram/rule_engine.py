@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import os
 import random
 import re
 import string
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from backend.database.models import ChatRuleModel, FallbackPolicyConfig
+
+DEFAULT_TZ_OFFSET_HOURS = int(os.getenv("APP_TIMEZONE_OFFSET_HOURS", "7"))
+APP_TIMEZONE = timezone(timedelta(hours=DEFAULT_TZ_OFFSET_HOURS))
 
 URL_REGEX = re.compile(
     r"(?:https?://|www\.|t\.me/|telegram\.me/)[^\s<>\"']+"
@@ -32,7 +36,7 @@ def render_spintax_and_variables(
         return ""
 
     ctx = context or {}
-    now = datetime.now()
+    now = datetime.now(APP_TIMEZONE)
     rand_token = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
     rendered = text
@@ -85,7 +89,7 @@ def is_within_active_hours(
     except (ValueError, IndexError):
         return True
 
-    current = now_dt or datetime.now()
+    current = now_dt or datetime.now(APP_TIMEZONE)
     current_minutes = current.hour * 60 + current.minute
 
     if start_minutes <= end_minutes:
@@ -366,6 +370,7 @@ class LearnedErrorResult:
     is_peer_flood: bool = False
     session_expired: bool = False
     account_banned_in_chat: bool = False
+    entity_not_found: bool = False
     reason_note: str | None = None
 
 
@@ -417,6 +422,8 @@ def classify_telegram_error(exc: Exception) -> LearnedErrorResult:
         or "USERDEACTIVATED" in err_name
         or "USER_DEACTIVATED" in err_text
         or "AUTH_KEY_DUPLICATED" in err_text
+        or "UNAUTHORIZED" in err_name
+        or "NOT AUTHORIZED" in err_text
     ):
         return LearnedErrorResult(
             learned_any_rule=False,
@@ -428,21 +435,34 @@ def classify_telegram_error(exc: Exception) -> LearnedErrorResult:
         "PEERFLOOD" in err_name
         or "PEER_FLOOD" in err_text
         or "TOO_MANY_REQUESTS" in err_text
-        or ("SPAM" in err_text and "FLOOD" in err_text)
+        or "TOO MANY REQUESTS" in err_text
+        or "USERRESTRICTED" in err_name
+        or "USER_RESTRICTED" in err_text
+        or "SPAMREPORTED" in err_text
+        or "BANNED FROM SENDING MESSAGES IN SUPERGROUPS" in err_text
+        or "BANNED FROM SENDING MESSAGES IN CHANNELS" in err_text
+        or (
+            "SPAM" in err_text
+            and any(k in err_text for k in ("FLOOD", "RESTRICT", "REPORT", "LIMIT"))
+        )
     ):
         return LearnedErrorResult(
             learned_any_rule=False,
             is_peer_flood=True,
-            flood_wait_seconds=int(seconds or 10800),  # 3h default quarantine on PeerFlood
-            reason_note="Telegram cảnh báo PeerFlood / Hạn chế Spam tạm thời — Tự động cách ly bảo vệ tài khoản",
+            flood_wait_seconds=int(seconds or 10800),  # 3h default quarantine on PeerFlood/@SpamBot
+            reason_note="Tài khoản dính hạn chế Spam (@SpamBot / PeerFlood) từ Telegram — Tự động cách ly & đảo sang Nick khác",
         )
 
-    if "FLOODWAIT" in err_name or "FLOOD_WAIT" in err_text:
+    if (
+        "FLOODWAIT" in err_name
+        or "FLOOD_WAIT" in err_text
+        or "A WAIT OF " in err_text
+    ):
         wait_s = int(seconds or 45)
         return LearnedErrorResult(
             learned_any_rule=False,
             flood_wait_seconds=wait_s,
-            reason_note=f"FloodWait {wait_s}s",
+            reason_note=f"FloodWait {wait_s}s — Tự động đảo sang Nick khác",
         )
 
     if "SLOWMODEWAIT" in err_name or "SLOWMODE_WAIT" in err_text:
@@ -454,17 +474,40 @@ def classify_telegram_error(exc: Exception) -> LearnedErrorResult:
         )
 
     if (
+        "COULD NOT FIND THE INPUT ENTITY" in err_text
+        or "CANNOT FIND ANY ENTITY" in err_text
+        or "PEER_ID_INVALID" in err_text
+        or "CHANNEL_INVALID" in err_text
+    ):
+        return LearnedErrorResult(
+            learned_any_rule=False,
+            entity_not_found=True,
+            reason_note="Tài khoản này chưa tham gia hoặc chưa đồng bộ phiên với nhóm đích — Tự động đảo sang Nick khác",
+        )
+
+    if (
         "USERBANNEDINCHANNEL" in err_name
         or "USER_BANNED_IN_CHANNEL" in err_text
         or "CHATWRITEFORBIDDEN" in err_name
         or "CHAT_WRITE_FORBIDDEN" in err_text
+        or "CAN'T WRITE IN THIS CHAT" in err_text
         or "CHANNELPRIVATE" in err_name
         or "CHANNEL_PRIVATE" in err_text
+        or "SPECIFIED CHANNEL IS PRIVATE" in err_text
+        or "CHATRESTRICTED" in err_name
+        or "CHAT_RESTRICTED" in err_text
+        or "USERNOTPARTICIPANT" in err_name
+        or "USER_NOT_PARTICIPANT" in err_text
+        or "CHATGUESTSENDFORBIDDEN" in err_name
+        or "CHAT_GUEST_SEND_FORBIDDEN" in err_text
+        or "JOIN THE DISCUSSION GROUP" in err_text
+        or "CHATADMINREQUIRED" in err_name
+        or "CHAT_ADMIN_REQUIRED" in err_text
     ):
         return LearnedErrorResult(
             learned_any_rule=False,
             account_banned_in_chat=True,
-            reason_note="Tài khoản bị hạn chế quyền chat hoặc bị khóa nhắn tin trong nhóm này",
+            reason_note="Tài khoản bị hạn chế quyền chat hoặc chưa tham gia nhóm này — Tự động đảo sang Nick khác",
         )
 
     if (

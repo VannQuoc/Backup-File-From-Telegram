@@ -120,6 +120,17 @@ export const ScenariosView: React.FC<ScenariosViewProps> = ({
     fallback_reasons: string[];
   } | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [triggeringId, setTriggeringId] = useState<number | null>(null);
+
+  const hasAnyRunningScenario = scenarios.some((s) => Boolean(s.live_run?.running));
+
+  useEffect(() => {
+    if (!hasAnyRunningScenario) return;
+    const timer = window.setInterval(() => {
+      onRefresh();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [hasAnyRunningScenario, onRefresh]);
 
   const loadLibrary = async () => {
     try {
@@ -1416,7 +1427,7 @@ export const ScenariosView: React.FC<ScenariosViewProps> = ({
                       </div>
                     ))}
                   </td>
-                  <td className="py-3 px-4 font-mono">
+                  <td className="py-3 px-4 font-mono space-y-1">
                     <div className="text-[#10B981] font-bold">
                       Đã gửi: {sc.total_sent_count} lượt
                     </div>
@@ -1424,26 +1435,68 @@ export const ScenariosView: React.FC<ScenariosViewProps> = ({
                       Mỗi {sc.interval_seconds}s (+{sc.jitter_min_sec}..{sc.jitter_max_sec}s)
                     </div>
                     {sc.active_hours_start && sc.active_hours_end && (
-                      <div className="text-[#F59E0B]">
+                      <div
+                        className={
+                          sc.within_active_hours === false ? 'text-[#EF4444] font-bold' : 'text-[#F59E0B]'
+                        }
+                      >
                         Giờ chạy: {sc.active_hours_start} - {sc.active_hours_end}
+                        {sc.enabled && sc.within_active_hours === false && ' (Đang ngoài khung giờ)'}
                       </div>
+                    )}
+                    {sc.next_run_at && sc.enabled && (
+                      <div className="text-[11px] text-[#A1A1AA]">
+                        Kế tiếp: {new Date(sc.next_run_at).toLocaleTimeString('vi-VN')}
+                      </div>
+                    )}
+                    {sc.live_run?.running && (
+                      <div className="px-2 py-1 bg-[#10B981]/15 border border-[#10B981] text-[#10B981] text-[11px] font-bold">
+                        ⚡ ĐANG CHẠY NGẦM: {sc.live_run.processed}/{sc.live_run.total_destinations} nhóm
+                        (OK: {sc.live_run.sent_count} · Skip: {sc.live_run.skipped_count} · Lỗi:{' '}
+                        {sc.live_run.failed_count})
+                      </div>
+                    )}
+                    {!sc.live_run?.running && sc.live_run?.last_message && (
+                      <div className="text-[11px] text-[#A1A1AA]">{sc.live_run.last_message}</div>
                     )}
                   </td>
                   <td className="py-3 px-4 text-right">
                     <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
                       <button
                         type="button"
+                        disabled={triggeringId === sc.id || Boolean(sc.live_run?.running)}
                         onClick={async () => {
-                          const res = await api.runScenarioNow(sc.id);
-                          setFeedback(
-                            `Đã chạy ngay kịch bản "${sc.name}" (${res.executed_count} đích thực thi).`,
-                          );
-                          onRefresh();
+                          setTriggeringId(sc.id);
+                          try {
+                            const res = await api.runScenarioNow(sc.id);
+                            if (res.status === 'already_running') {
+                              setFeedback(
+                                `Kịch bản "${sc.name}" đang chạy ngầm (${res.executed_count}/${
+                                  res.total_destinations ?? 0
+                                } nhóm)...`,
+                              );
+                            } else {
+                              setFeedback(
+                                `⚡ Đã kích hoạt chạy ngầm kịch bản "${sc.name}" cho ${
+                                  res.total_destinations ?? res.executed_count
+                                } nhóm đích! Tiến độ sẽ tự cập nhật trực tiếp mỗi 2.5s.`,
+                              );
+                            }
+                            onRefresh();
+                          } catch (err) {
+                            setFeedback(
+                              `❌ Lỗi chạy kịch bản "${sc.name}": ${
+                                err instanceof Error ? err.message : 'Không xác định'
+                              }`,
+                            );
+                          } finally {
+                            setTriggeringId(null);
+                          }
                         }}
-                        className="px-2.5 py-1.5 bg-[#10B981] text-[#052E16] font-bold font-mono flex items-center gap-1 cursor-pointer"
+                        className="px-2.5 py-1.5 bg-[#10B981] disabled:opacity-50 text-[#052E16] font-bold font-mono flex items-center gap-1 cursor-pointer"
                       >
                         <Play size={13} weight="fill" />
-                        <span>Gửi Ngay</span>
+                        <span>{sc.live_run?.running ? 'Đang Gửi...' : 'Gửi Ngay'}</span>
                       </button>
                       <button
                         type="button"

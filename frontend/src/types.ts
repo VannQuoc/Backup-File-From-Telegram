@@ -196,6 +196,21 @@ export interface ScenarioTarget {
   next_run_at?: string | null;
 }
 
+export interface ScenarioLiveRun {
+  scenario_id: number;
+  scenario_name?: string;
+  running: boolean;
+  trigger?: string;
+  total_destinations: number;
+  processed: number;
+  sent_count: number;
+  skipped_count: number;
+  failed_count: number;
+  started_at: string | null;
+  finished_at: string | null;
+  last_message: string | null;
+}
+
 export interface Scenario {
   id: number;
   name: string;
@@ -209,6 +224,9 @@ export interface Scenario {
   daily_times: string[];
   active_hours_start: string | null;
   active_hours_end: string | null;
+  within_active_hours?: boolean;
+  next_run_at?: string | null;
+  live_run?: ScenarioLiveRun | null;
   delete_previous_sent_message: boolean;
   delete_if_within_x_messages?: number;
   skip_if_within_x_messages?: number;

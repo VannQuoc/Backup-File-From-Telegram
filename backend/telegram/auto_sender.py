@@ -209,6 +209,24 @@ class AutoSenderEngine:
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
+        self._active_runs: dict[int, dict[str, Any]] = {}
+        self._bg_tasks: dict[int, asyncio.Task[Any]] = {}
+
+    def get_scenario_run_status(self, scenario_id: int) -> dict[str, Any] | None:
+        state = self._active_runs.get(scenario_id)
+        if not state:
+            return None
+        bg_task = self._bg_tasks.get(scenario_id)
+        is_running = bool(state.get("running")) and (bg_task is None or not bg_task.done())
+        return {**state, "running": is_running}
+
+    def list_active_runs(self) -> dict[int, dict[str, Any]]:
+        out: dict[int, dict[str, Any]] = {}
+        for sid in list(self._active_runs.keys()):
+            st = self.get_scenario_run_status(sid)
+            if st is not None:
+                out[sid] = st
+        return out
 
     async def start(self) -> None:
         if self._running:
@@ -225,18 +243,75 @@ class AutoSenderEngine:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        for sid, task in list(self._bg_tasks.items()):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as stop_exc:
+                    logger.debug("Background scenario #%s stop warning: %s", sid, stop_exc)
+            self._bg_tasks.pop(sid, None)
 
     async def _scheduler_loop(self) -> None:
         while self._running:
             try:
-                await self.tick()
+                await self.tick(background_per_scenario=True)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.warning("AutoSender tick error: %s", exc)
             await asyncio.sleep(self._config.auto_send_tick_seconds)
 
-    async def tick(self) -> list[dict[str, Any]]:
+    async def _run_scheduled_targets_worker(
+        self, scenario: dict[str, Any], due_targets: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        scenario_id = int(scenario["id"])
+        temp_sc = {**scenario, "targets": due_targets}
+        total_dests = len(expand_scenario_destinations(self._store, temp_sc))
+        self._active_runs[scenario_id] = {
+            "scenario_id": scenario_id,
+            "scenario_name": scenario["name"],
+            "running": True,
+            "trigger": "schedule",
+            "total_destinations": total_dests,
+            "processed": 0,
+            "sent_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "started_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            "finished_at": None,
+            "last_message": f"Đang chạy tự động theo lịch ({total_dests} nhóm)...",
+        }
+        results: list[dict[str, Any]] = []
+        try:
+            for target in due_targets:
+                res = await self.execute_scenario_target(scenario, target, force=False)
+                results.extend(res)
+            cur = self._active_runs.get(scenario_id) or {}
+            cur["running"] = False
+            cur["finished_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+            cur["last_message"] = (
+                f"Hoàn tất lịch tự động: Gửi {cur.get('sent_count', 0)} · "
+                f"Skip {cur.get('skipped_count', 0)} · Lỗi {cur.get('failed_count', 0)}"
+            )
+        except asyncio.CancelledError:
+            cur = self._active_runs.get(scenario_id)
+            if cur:
+                cur["running"] = False
+                cur["last_message"] = "Đã dừng tác vụ khi tắt hệ thống"
+            raise
+        except Exception as exc:
+            logger.warning("Scheduled scenario #%s error: %s", scenario_id, exc)
+            cur = self._active_runs.get(scenario_id)
+            if cur:
+                cur["running"] = False
+                cur["finished_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+                cur["last_message"] = f"Lỗi chạy kịch bản: {exc}"
+        return results
+
+    async def tick(self, *, background_per_scenario: bool = False) -> list[dict[str, Any]]:
         # Feature #17: Respect Global Panic / Kill Switch
         if self._store.is_global_paused():
             return []
@@ -246,6 +321,11 @@ class AutoSenderEngine:
         scenarios = self._store.list_scenarios(enabled_only=True)
 
         for scenario in scenarios:
+            scenario_id = int(scenario["id"])
+            existing_task = self._bg_tasks.get(scenario_id)
+            if existing_task and not existing_task.done():
+                continue
+
             # Feature #8: Check Active Hours / Quiet Hours window
             if not is_within_active_hours(
                 scenario.get("active_hours_start"),
@@ -254,13 +334,104 @@ class AutoSenderEngine:
                 continue
 
             targets = [t for t in scenario.get("targets", []) if t.get("enabled", True)]
-            for target in targets:
-                next_run = target.get("next_run_at")
-                if next_run and next_run > now_iso:
-                    continue
-                res = await self.execute_scenario_target(scenario, target)
-                results.extend(res)
+            due_targets = [
+                t
+                for t in targets
+                if not t.get("next_run_at") or str(t.get("next_run_at")) <= now_iso
+            ]
+            if not due_targets:
+                continue
+
+            if background_per_scenario:
+                self._bg_tasks[scenario_id] = asyncio.create_task(
+                    self._run_scheduled_targets_worker(scenario, due_targets)
+                )
+            else:
+                for target in due_targets:
+                    res = await self.execute_scenario_target(scenario, target)
+                    results.extend(res)
         return results
+
+    async def trigger_scenario_background(self, scenario_id: int) -> dict[str, Any]:
+        """
+        Starts `scenario_id` asynchronously in the background and returns immediately (<10ms)
+        so HTTP requests (`POST /api/scenarios/{id}/run`) never block or time out on large folders.
+        """
+        scenario = self._store.get_scenario(scenario_id)
+        if not scenario:
+            raise ValueError(f"Không tìm thấy kịch bản #{scenario_id}")
+
+        existing_task = self._bg_tasks.get(scenario_id)
+        if existing_task and not existing_task.done():
+            cur_state = self.get_scenario_run_status(scenario_id) or {}
+            return {
+                "scenario_id": scenario_id,
+                "status": "already_running",
+                "background": True,
+                "total_destinations": int(cur_state.get("total_destinations") or 0),
+                "executed_count": int(cur_state.get("processed") or 0),
+                "live_run": cur_state,
+                "logs": [],
+            }
+
+        destinations = expand_scenario_destinations(self._store, scenario)
+        run_state: dict[str, Any] = {
+            "scenario_id": scenario_id,
+            "scenario_name": scenario["name"],
+            "running": True,
+            "trigger": "manual",
+            "total_destinations": len(destinations),
+            "processed": 0,
+            "sent_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "started_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            "finished_at": None,
+            "last_message": (
+                f"Đang chạy ngầm kịch bản '{scenario['name']}' tới {len(destinations)} nhóm..."
+                if destinations
+                else "Kịch bản chưa gắn nhóm/folder mục tiêu nào đang bật."
+            ),
+        }
+        self._active_runs[scenario_id] = run_state
+
+        async def _worker() -> None:
+            try:
+                await self.run_scenario_now(scenario_id)
+                cur = self._active_runs.get(scenario_id) or run_state
+                cur["running"] = False
+                cur["finished_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+                cur["last_message"] = (
+                    f"Hoàn tất gửi {cur.get('processed', 0)}/{cur.get('total_destinations', 0)} đích: "
+                    f"Thành công {cur.get('sent_count', 0)} · Skip {cur.get('skipped_count', 0)} · "
+                    f"Lỗi {cur.get('failed_count', 0)}"
+                )
+                if self._broadcaster:
+                    await self._broadcaster({"type": "auto_send_completed", "data": dict(cur)})
+            except asyncio.CancelledError:
+                cur = self._active_runs.get(scenario_id)
+                if cur:
+                    cur["running"] = False
+                    cur["last_message"] = "Tác vụ gửi ngầm đã dừng"
+                raise
+            except Exception as exc:
+                logger.warning("Background run_scenario_now #%s error: %s", scenario_id, exc)
+                cur = self._active_runs.get(scenario_id)
+                if cur:
+                    cur["running"] = False
+                    cur["finished_at"] = datetime.now(UTC).replace(microsecond=0).isoformat()
+                    cur["last_message"] = f"Lỗi thực thi kịch bản: {exc}"
+
+        self._bg_tasks[scenario_id] = asyncio.create_task(_worker())
+        return {
+            "scenario_id": scenario_id,
+            "status": "started",
+            "background": True,
+            "total_destinations": len(destinations),
+            "executed_count": 0,
+            "live_run": dict(run_state),
+            "logs": [],
+        }
 
     async def run_scenario_now(self, scenario_id: int) -> list[dict[str, Any]]:
         scenario = self._store.get_scenario(scenario_id)
@@ -357,9 +528,20 @@ class AutoSenderEngine:
                     ),
                 )
                 execution_records.append(log)
+                live = self._active_runs.get(scenario_id)
+                if live is not None:
+                    live["processed"] = int(live.get("processed", 0)) + 1
+                    live["failed_count"] = int(live.get("failed_count", 0)) + 1
+                    live["last_message"] = (
+                        f"Đang xử lý {live['processed']}/{live.get('total_destinations', len(destinations))} nhóm · "
+                        f"Hết tài khoản khả dụng cho nhóm {chat_id}"
+                    )
+                    if self._broadcaster:
+                        await self._broadcaster({"type": "auto_send_progress", "data": dict(live)})
                 continue
 
             account_id, client = picked
+            dest_last_status = "failed"
             for step in selected_steps:
                 rec = await self._send_step_to_chat(
                     client=client,
@@ -372,19 +554,43 @@ class AutoSenderEngine:
                     apply_hash_variation=is_multi_dest,
                 )
                 execution_records.append(rec)
-                if rec.get("status") == "success":
+                dest_last_status = str(rec.get("status") or "failed")
+                if dest_last_status == "success":
                     sent_counter += 1
 
-                if is_multi_dest and dest_idx < len(destinations) - 1:
-                    is_real_tg = type(client).__name__ == "TelegramClient"
-                    if is_real_tg:
-                        # Adaptive Anti-Spam Pacing: 3.5s - 7.5s between groups, plus a 12-20s micro-break every 5 groups
-                        delay_s = random.uniform(3.5, 7.5)
-                        if (dest_idx + 1) % 5 == 0:
-                            delay_s += random.uniform(12.0, 20.0)
-                        await asyncio.sleep(delay_s)
+            live = self._active_runs.get(scenario_id)
+            if live is not None:
+                live["processed"] = int(live.get("processed", 0)) + 1
+                if dest_last_status == "success":
+                    live["sent_count"] = int(live.get("sent_count", 0)) + 1
+                elif dest_last_status == "skipped":
+                    live["skipped_count"] = int(live.get("skipped_count", 0)) + 1
+                else:
+                    live["failed_count"] = int(live.get("failed_count", 0)) + 1
+                live["last_message"] = (
+                    f"Đang chạy {live['processed']}/{live.get('total_destinations', len(destinations))} nhóm: "
+                    f"Thành công {live.get('sent_count', 0)} · Skip {live.get('skipped_count', 0)} · "
+                    f"Lỗi {live.get('failed_count', 0)}"
+                )
+                if self._broadcaster:
+                    await self._broadcaster({"type": "auto_send_progress", "data": dict(live)})
+
+            if is_multi_dest and dest_idx < len(destinations) - 1:
+                is_real_tg = type(client).__name__ == "TelegramClient"
+                if is_real_tg:
+                    if force:
+                        # Manual run ("Gửi Ngay"): responsive anti-spam pacing in background
+                        delay_s = random.uniform(1.8, 3.5)
+                        if (dest_idx + 1) % 6 == 0:
+                            delay_s += random.uniform(5.0, 9.0)
                     else:
-                        await asyncio.sleep(random.uniform(0.05, 0.15))
+                        # Scheduled background run: natural human pacing
+                        delay_s = random.uniform(3.2, 6.8)
+                        if (dest_idx + 1) % 5 == 0:
+                            delay_s += random.uniform(10.0, 16.0)
+                    await asyncio.sleep(delay_s)
+                else:
+                    await asyncio.sleep(random.uniform(0.02, 0.08))
 
         next_run_iso = compute_next_run_iso(scenario, target)
         self._store.advance_scenario_target_schedule(
@@ -624,188 +830,222 @@ class AutoSenderEngine:
                 precomputed_distance=precomputed_dist,
             )
 
-        try:
-            await self._simulate_human_typing(client, chat_id, plan.text_content)
-            sent_msg_id = await self._dispatch_plan_via_telethon(
-                client, chat_id, topic_id, plan, chat_rule.no_media
-            )
-            if sent_msg_id:
-                self._store.record_last_sent_message_for_scenario(
-                    scenario_id=scenario_id,
+        chat_username = str((chat_info or {}).get("username") or "").strip() or None
+        current_rule = chat_rule
+        current_plan = plan
+        cur_acc_id = account_id
+        cur_client = client
+        tried_account_ids: set[int] = {account_id}
+        failover_notes: list[str] = []
+        rule_fallback_note: str | None = None
+        retried_rule_on_current_acc = False
+        last_exc: Exception | None = None
+        last_learned_reason: str | None = None
+
+        for _attempt in range(25):
+            try:
+                await self._simulate_human_typing(cur_client, chat_id, current_plan.text_content)
+                sent_msg_id = await self._dispatch_plan_via_telethon(
+                    cur_client,
+                    chat_id,
+                    topic_id,
+                    current_plan,
+                    current_rule.no_media,
+                    chat_username=chat_username,
+                )
+                if sent_msg_id:
+                    self._store.record_last_sent_message_for_scenario(
+                        scenario_id=scenario_id,
+                        chat_id=chat_id,
+                        topic_id=topic_id,
+                        account_id=cur_acc_id,
+                        last_msg_id=sent_msg_id,
+                    )
+
+                reason_parts: list[str] = []
+                if failover_notes:
+                    reason_parts.append(
+                        f"Tự động đảo sang Nick #{cur_acc_id} do {' -> '.join(failover_notes)}"
+                    )
+                if rule_fallback_note:
+                    reason_parts.append(rule_fallback_note)
+                if current_plan.fallback_reason_summary:
+                    reason_parts.append(current_plan.fallback_reason_summary)
+
+                combined_fallback_reason = "; ".join(reason_parts) if reason_parts else None
+                was_fallback = bool(current_plan.fallback_applied or failover_notes or rule_fallback_note)
+                msg_prefix = (
+                    f"Đã gửi thành công ({current_plan.action_to_execute}) tới nhóm {chat_id} bằng Nick #{cur_acc_id}"
+                )
+                return self._store.add_execution_log(
+                    category="auto_send",
+                    level="INFO",
+                    account_id=cur_acc_id,
                     chat_id=chat_id,
                     topic_id=topic_id,
-                    account_id=account_id,
-                    last_msg_id=sent_msg_id,
+                    scenario_id=scenario_id,
+                    action_attempted=attempted_action,
+                    action_executed=current_plan.action_to_execute,
+                    fallback_applied=was_fallback,
+                    fallback_reason=combined_fallback_reason,
+                    status="success",
+                    message=(
+                        msg_prefix
+                        + (f" [{combined_fallback_reason}]" if combined_fallback_reason else "")
+                    ),
                 )
-            return self._store.add_execution_log(
-                category="auto_send",
-                level="INFO",
-                account_id=account_id,
-                chat_id=chat_id,
-                topic_id=topic_id,
-                scenario_id=scenario_id,
-                action_attempted=attempted_action,
-                action_executed=plan.action_to_execute,
-                fallback_applied=plan.fallback_applied,
-                fallback_reason=plan.fallback_reason_summary,
-                status="success",
-                message=(
-                    f"Đã gửi ({plan.action_to_execute}) tới nhóm {chat_id}"
-                    + (f" [Fallback: {plan.fallback_reason_summary}]" if plan.fallback_applied else "")
-                ),
-            )
-        except Exception as first_exc:
-            learned = classify_telegram_error(first_exc)
+            except Exception as exc:
+                last_exc = exc
+                learned = classify_telegram_error(exc)
+                last_learned_reason = learned.reason_note
 
-            # 1) Account Session Expired -> Switch status to `need_login` immediately!
-            if learned.session_expired:
-                self._store.update_account_status(
-                    account_id,
-                    "need_login",
-                    last_error=learned.reason_note or str(first_exc),
-                )
-
-            # 2) PeerFlood / FloodWait -> Quarantine account to protect from permanent Telegram ban!
-            if learned.is_peer_flood or learned.flood_wait_seconds:
-                wait_sec = int(learned.flood_wait_seconds or (10800 if learned.is_peer_flood else 60))
-                self._store.quarantine_account_flood(
-                    account_id,
-                    wait_sec,
-                    learned.reason_note or f"FloodWait/PeerFlood ({wait_sec}s)",
-                    status="flood_wait",
-                )
-
-            # 3) Account muted/banned in this specific group -> Mark `can_send_messages=False`
-            if learned.account_banned_in_chat:
-                self._store.upsert_account_membership(
-                    AccountMembershipModel(
-                        account_id=account_id,
-                        chat_id=chat_id,
-                        role="restricted",
-                        can_send_messages=False,
-                        can_send_media=False,
-                        can_send_stickers=False,
-                        can_embed_links=False,
+                # 1) Account Session Expired -> Transition status to `need_login` immediately!
+                if learned.session_expired:
+                    self._store.update_account_status(
+                        cur_acc_id,
+                        "need_login",
+                        last_error=learned.reason_note or str(exc),
                     )
-                )
 
-            # 4) Instant Multi-Account Failover if current account had session/flood/ban issue
-            if (
-                learned.session_expired
-                or learned.is_peer_flood
-                or learned.flood_wait_seconds
-                or learned.account_banned_in_chat
-            ):
-                try:
-                    failover = await self._pool.pick_any_authorized_client(
-                        preferred_account_id=None,
-                        target_chat_id=chat_id,
-                        exclude_account_ids={account_id},
+                # 2) Global Spam (@SpamBot / PeerFlood / UserRestricted) or FloodWait -> Quarantine account!
+                if learned.is_peer_flood or learned.flood_wait_seconds:
+                    wait_sec = int(
+                        learned.flood_wait_seconds or (10800 if learned.is_peer_flood else 60)
                     )
-                except TypeError:
-                    failover = None
+                    self._store.quarantine_account_flood(
+                        cur_acc_id,
+                        wait_sec,
+                        learned.reason_note or f"FloodWait/Spam ({wait_sec}s)",
+                        status="flood_wait",
+                    )
 
-                if failover:
-                    alt_acc_id, alt_client = failover
-                    try:
-                        await self._simulate_human_typing(alt_client, chat_id, plan.text_content)
-                        sent_msg_id = await self._dispatch_plan_via_telethon(
-                            alt_client, chat_id, topic_id, plan, chat_rule.no_media
+                # 3) Account muted/banned or not joined in this group -> Mark `can_send_messages=False`
+                if learned.account_banned_in_chat or learned.entity_not_found:
+                    self._store.upsert_account_membership(
+                        AccountMembershipModel(
+                            account_id=cur_acc_id,
+                            chat_id=chat_id,
+                            role="restricted",
+                            can_send_messages=False,
+                            can_send_media=False,
+                            can_send_stickers=False,
+                            can_embed_links=False,
+                            is_member=not learned.entity_not_found,
                         )
-                        if sent_msg_id:
-                            self._store.record_last_sent_message_for_scenario(
-                                scenario_id=scenario_id,
-                                chat_id=chat_id,
-                                topic_id=topic_id,
-                                account_id=alt_acc_id,
-                                last_msg_id=sent_msg_id,
-                            )
-                        failover_note = (
-                            f"Tự động đảo sang Nick #{alt_acc_id} do Nick #{account_id} gặp sự cố "
-                            f"({learned.reason_note or first_exc})"
+                    )
+
+                # 4) Group Content Restriction Auto-Learn (Sticker/Forward/Media/Link/Bot forbidden)
+                if learned.learned_any_rule and not learned.slow_mode_seconds:
+                    current_rule = self._store.auto_learn_chat_restriction(
+                        chat_id,
+                        no_links=learned.no_links,
+                        no_stickers=learned.no_stickers,
+                        no_forwards=learned.no_forwards,
+                        no_media=learned.no_media,
+                        no_bot_mentions=learned.no_bot_mentions,
+                        slow_mode_seconds=None,
+                        reason_note=learned.reason_note,
+                    )
+                    cur_acc_info = self._store.get_account(cur_acc_id)
+                    updated_ctx = {
+                        **render_ctx,
+                        "account_name": (cur_acc_info or {}).get("label") or f"Acc #{cur_acc_id}",
+                    }
+                    retry_plan = resolve_execution_plan(
+                        step,
+                        current_rule,
+                        override_text_content=override_text_content,
+                        render_context=updated_ctx,
+                    )
+                    if apply_hash_variation and retry_plan.text_content:
+                        retry_plan.text_content = apply_anti_spam_text_variation(
+                            retry_plan.text_content, chat_id
                         )
+                    if retry_plan.action_to_execute == "skip":
                         return self._store.add_execution_log(
                             category="auto_send",
                             level="INFO",
-                            account_id=alt_acc_id,
+                            account_id=cur_acc_id,
                             chat_id=chat_id,
                             topic_id=topic_id,
                             scenario_id=scenario_id,
                             action_attempted=attempted_action,
-                            action_executed=plan.action_to_execute,
+                            action_executed="skip",
                             fallback_applied=True,
-                            fallback_reason=failover_note,
-                            status="success",
-                            message=f"Đã gửi thành công tới {chat_id} nhờ Failover sang Nick #{alt_acc_id}",
+                            fallback_reason=retry_plan.fallback_reason_summary,
+                            status="skipped",
+                            message=f"Tự động học Rule & bỏ qua nhóm {chat_id}: {retry_plan.fallback_reason_summary}",
                         )
-                    except Exception as failover_exc:
-                        first_exc = failover_exc
+                    if not retried_rule_on_current_acc:
+                        current_plan = retry_plan
+                        retried_rule_on_current_acc = True
+                        rule_fallback_note = learned.reason_note
+                        continue
 
-            # LAYER 2: Runtime Error Auto-Learn & Instant Fallback Retry
-            if learned.learned_any_rule:
-                updated_rule = self._store.auto_learn_chat_restriction(
-                    chat_id,
-                    no_links=learned.no_links,
-                    no_stickers=learned.no_stickers,
-                    no_forwards=learned.no_forwards,
-                    no_media=learned.no_media,
-                    no_bot_mentions=learned.no_bot_mentions,
-                    slow_mode_seconds=learned.slow_mode_seconds,
-                    reason_note=learned.reason_note,
+                if learned.slow_mode_seconds:
+                    current_rule = self._store.auto_learn_chat_restriction(
+                        chat_id,
+                        slow_mode_seconds=learned.slow_mode_seconds,
+                        reason_note=learned.reason_note,
+                    )
+
+                # 5) Cascade Failover across ALL remaining connected accounts in the pool!
+                should_failover_account = bool(
+                    learned.session_expired
+                    or learned.is_peer_flood
+                    or learned.flood_wait_seconds
+                    or learned.account_banned_in_chat
+                    or learned.entity_not_found
+                    or learned.slow_mode_seconds
                 )
-                retry_plan = resolve_execution_plan(
-                    step,
-                    updated_rule,
-                    override_text_content=override_text_content,
-                    render_context=render_ctx,
-                )
-                if retry_plan.action_to_execute != "skip":
+                if should_failover_account:
+                    failover_notes.append(f"Nick #{cur_acc_id} ({learned.reason_note or exc})")
                     try:
-                        sent_msg_id = await self._dispatch_plan_via_telethon(
-                            client, chat_id, topic_id, retry_plan, updated_rule.no_media
+                        next_pick = await self._pool.pick_any_authorized_client(
+                            preferred_account_id=None,
+                            target_chat_id=chat_id,
+                            exclude_account_ids=set(tried_account_ids),
                         )
-                        if sent_msg_id:
-                            self._store.record_last_sent_message_for_scenario(
-                                scenario_id=scenario_id,
-                                chat_id=chat_id,
-                                topic_id=topic_id,
-                                account_id=account_id,
-                                last_msg_id=sent_msg_id,
-                            )
-                        combined_reason = "; ".join(
-                            filter(None, [learned.reason_note, retry_plan.fallback_reason_summary])
-                        )
-                        return self._store.add_execution_log(
-                            category="auto_send",
-                            level="INFO",
-                            account_id=account_id,
-                            chat_id=chat_id,
-                            topic_id=topic_id,
-                            scenario_id=scenario_id,
-                            action_attempted=attempted_action,
-                            action_executed=retry_plan.action_to_execute,
-                            fallback_applied=True,
-                            fallback_reason=combined_reason,
-                            status="success",
-                            message=f"Tự động học Rule & gửi lại thành công ({retry_plan.action_to_execute}) tới {chat_id}: {combined_reason}",
-                        )
-                    except Exception as second_exc:
-                        first_exc = second_exc
+                    except TypeError:
+                        next_pick = None
 
-            return self._store.add_execution_log(
-                category="auto_send",
-                level="ERROR",
-                account_id=account_id,
-                chat_id=chat_id,
-                topic_id=topic_id,
-                scenario_id=scenario_id,
-                action_attempted=attempted_action,
-                action_executed=plan.action_to_execute,
-                fallback_applied=plan.fallback_applied,
-                fallback_reason=learned.reason_note or plan.fallback_reason_summary,
-                status="failed",
-                message=f"Gửi thất bại tới nhóm {chat_id}: {learned.reason_note or first_exc}",
-            )
+                    if next_pick and int(next_pick[0]) not in tried_account_ids:
+                        cur_acc_id, cur_client = int(next_pick[0]), next_pick[1]
+                        tried_account_ids.add(cur_acc_id)
+                        retried_rule_on_current_acc = False
+                        cur_acc_info = self._store.get_account(cur_acc_id)
+                        updated_ctx = {
+                            **render_ctx,
+                            "account_name": (cur_acc_info or {}).get("label") or f"Acc #{cur_acc_id}",
+                        }
+                        current_plan = resolve_execution_plan(
+                            step,
+                            current_rule,
+                            override_text_content=override_text_content,
+                            render_context=updated_ctx,
+                        )
+                        if apply_hash_variation and current_plan.text_content:
+                            current_plan.text_content = apply_anti_spam_text_variation(
+                                current_plan.text_content, chat_id
+                            )
+                        continue
+                break
+
+        trail_detail = f" [Đã thử {len(tried_account_ids)} nick: {'; '.join(failover_notes)}]" if failover_notes else ""
+        return self._store.add_execution_log(
+            category="auto_send",
+            level="ERROR",
+            account_id=cur_acc_id,
+            chat_id=chat_id,
+            topic_id=topic_id,
+            scenario_id=scenario_id,
+            action_attempted=attempted_action,
+            action_executed=current_plan.action_to_execute,
+            fallback_applied=bool(current_plan.fallback_applied or failover_notes),
+            fallback_reason=last_learned_reason or current_plan.fallback_reason_summary,
+            status="failed",
+            message=f"Gửi thất bại tới nhóm {chat_id}: {last_learned_reason or last_exc}{trail_detail}",
+        )
 
     async def _dispatch_plan_via_telethon(
         self,
@@ -814,83 +1054,104 @@ class AutoSenderEngine:
         topic_id: int,
         plan: ResolvedSendPlan,
         no_media: bool = False,
+        *,
+        chat_username: str | None = None,
     ) -> int | None:
         reply_to = topic_id if topic_id > 0 else None
         action = plan.action_to_execute
 
-        if action == "forward_message":
-            if not plan.forward_from_chat_id or not plan.forward_from_msg_id:
-                raise ValueError("Thiếu forward_from_chat_id hoặc forward_from_msg_id")
-            sent = await client.forward_messages(
-                entity=chat_id,
-                messages=int(plan.forward_from_msg_id),
-                from_peer=int(plan.forward_from_chat_id),
-            )
-            if isinstance(sent, list) and sent:
-                return int(getattr(sent[0], "id", 0) or 0)
-            return int(getattr(sent, "id", 0) or 0)
+        async def _send_to_entity(target_entity: Any) -> int | None:
+            if action == "forward_message":
+                if not plan.forward_from_chat_id or not plan.forward_from_msg_id:
+                    raise ValueError("Thiếu forward_from_chat_id hoặc forward_from_msg_id")
+                sent = await client.forward_messages(
+                    entity=target_entity,
+                    messages=int(plan.forward_from_msg_id),
+                    from_peer=int(plan.forward_from_chat_id),
+                )
+                if isinstance(sent, list) and sent:
+                    return int(getattr(sent[0], "id", 0) or 0)
+                return int(getattr(sent, "id", 0) or 0)
 
-        if action == "copy_source_message":
-            if not plan.forward_from_chat_id or not plan.forward_from_msg_id:
-                raise ValueError("Thiếu nguồn để copy tin nhắn")
-            src_msg = await client.get_messages(
-                int(plan.forward_from_chat_id), ids=int(plan.forward_from_msg_id)
-            )
-            if not src_msg:
-                raise ValueError("Không tìm thấy tin nhắn mẫu để copy")
-            msg_text = plan.text_content or getattr(src_msg, "message", "") or ""
-            if getattr(src_msg, "media", None) and not no_media:
-                sent = await client.send_file(
-                    entity=chat_id,
-                    file=src_msg.media,
-                    caption=msg_text or None,
+            if action == "copy_source_message":
+                if not plan.forward_from_chat_id or not plan.forward_from_msg_id:
+                    raise ValueError("Thiếu nguồn để copy tin nhắn")
+                src_msg = await client.get_messages(
+                    int(plan.forward_from_chat_id), ids=int(plan.forward_from_msg_id)
+                )
+                if not src_msg:
+                    raise ValueError("Không tìm thấy tin nhắn mẫu để copy")
+                msg_text = plan.text_content or getattr(src_msg, "message", "") or ""
+                if getattr(src_msg, "media", None) and not no_media:
+                    sent = await client.send_file(
+                        entity=target_entity,
+                        file=src_msg.media,
+                        caption=msg_text or None,
+                        reply_to=reply_to,
+                    )
+                else:
+                    sent = await client.send_message(
+                        entity=target_entity,
+                        message=msg_text or "(Tin nhắn sao chép)",
+                        reply_to=reply_to,
+                        link_preview=plan.link_preview,
+                    )
+                return int(getattr(sent, "id", 0) or 0)
+
+            if action == "send_sticker":
+                if not plan.sticker_id_or_path:
+                    raise ValueError("Thiếu sticker_id_or_path")
+                return await self._resolve_and_send_file_or_sticker(
+                    client=client,
+                    chat_id=target_entity,
+                    raw_input=plan.sticker_id_or_path,
+                    caption=None,
                     reply_to=reply_to,
                 )
-            else:
-                sent = await client.send_message(
-                    entity=chat_id,
-                    message=msg_text or "(Tin nhắn sao chép)",
+
+            if action == "send_media":
+                if not plan.media_path:
+                    raise ValueError("Thiếu media_path")
+                return await self._resolve_and_send_file_or_sticker(
+                    client=client,
+                    chat_id=target_entity,
+                    raw_input=plan.media_path,
+                    caption=plan.text_content or None,
                     reply_to=reply_to,
-                    link_preview=plan.link_preview,
                 )
+
+            # Default: send_text
+            sent = await client.send_message(
+                entity=target_entity,
+                message=plan.text_content or "",
+                reply_to=reply_to,
+                link_preview=plan.link_preview,
+            )
             return int(getattr(sent, "id", 0) or 0)
 
-        if action == "send_sticker":
-            if not plan.sticker_id_or_path:
-                raise ValueError("Thiếu sticker_id_or_path")
-            return await self._resolve_and_send_file_or_sticker(
-                client=client,
-                chat_id=chat_id,
-                raw_input=plan.sticker_id_or_path,
-                caption=None,
-                reply_to=reply_to,
-            )
-
-        if action == "send_media":
-            if not plan.media_path:
-                raise ValueError("Thiếu media_path")
-            return await self._resolve_and_send_file_or_sticker(
-                client=client,
-                chat_id=chat_id,
-                raw_input=plan.media_path,
-                caption=plan.text_content or None,
-                reply_to=reply_to,
-            )
-
-        # Default: send_text
-        sent = await client.send_message(
-            entity=chat_id,
-            message=plan.text_content or "",
-            reply_to=reply_to,
-            link_preview=plan.link_preview,
-        )
-        return int(getattr(sent, "id", 0) or 0)
+        try:
+            return await _send_to_entity(chat_id)
+        except Exception as exc:
+            err_upper = str(exc).upper()
+            if chat_username and (
+                "COULD NOT FIND THE INPUT ENTITY" in err_upper
+                or "CANNOT FIND ANY ENTITY" in err_upper
+            ):
+                uname = f"@{chat_username.lstrip('@')}"
+                resolved_peer: Any = uname
+                if hasattr(client, "get_input_entity"):
+                    try:
+                        resolved_peer = await client.get_input_entity(uname)
+                    except Exception:
+                        resolved_peer = uname
+                return await _send_to_entity(resolved_peer)
+            raise
 
     async def _resolve_and_send_file_or_sticker(
         self,
         *,
         client: Any,
-        chat_id: int,
+        chat_id: Any,
         raw_input: str,
         caption: str | None,
         reply_to: int | None,

@@ -96,7 +96,13 @@ class TelegramClientPool:
         session_path.parent.mkdir(parents=True, exist_ok=True)
         session_str = str(session_path.with_suffix(""))
         proxy = parse_proxy_url(account.get("proxy_url"))
-        return TelegramClient(session_str, api_id, api_hash, proxy=proxy)
+        return TelegramClient(
+            session_str,
+            api_id,
+            api_hash,
+            proxy=proxy,
+            flood_sleep_threshold=3,
+        )
 
     async def connect_all_enabled(self) -> None:
         accounts = self._store.list_accounts(enabled_only=True)
@@ -205,7 +211,11 @@ class TelegramClientPool:
            and within quota, sorted by least messages sent in the last 5m & 1h.
         3. Otherwise -> pick any connected account within quota.
         """
-        excluded = exclude_account_ids or set()
+        excluded = set(exclude_account_ids or set())
+        if target_chat_id is not None:
+            for mem in self._store.get_chat_memberships(target_chat_id):
+                if not mem.get("can_send_messages", True):
+                    excluded.add(int(mem["account_id"]))
 
         if preferred_account_id is not None and preferred_account_id not in excluded:
             within_quota, _ = self._store.is_account_within_quota(preferred_account_id)

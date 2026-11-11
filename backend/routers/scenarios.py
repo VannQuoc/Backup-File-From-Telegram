@@ -17,7 +17,7 @@ from backend.database.models import (
     ScenarioUpdateRequest,
 )
 from backend.telegram.auto_sender import expand_scenario_destinations
-from backend.telegram.rule_engine import resolve_execution_plan
+from backend.telegram.rule_engine import is_within_active_hours, resolve_execution_plan
 
 router = APIRouter(prefix="/api/scenarios", tags=["scenarios"], dependencies=[Depends(require_auth)])
 
@@ -32,7 +32,29 @@ class SimulateFallbackRequest(BaseModel):
 @router.get("")
 async def list_scenarios(request: Request) -> list[dict[str, Any]]:
     store = request.app.state.store
-    return store.list_scenarios()
+    auto_sender = request.app.state.auto_sender
+    raw_list = store.list_scenarios()
+    enriched: list[dict[str, Any]] = []
+    for sc in raw_list:
+        sid = int(sc["id"])
+        enabled_targets = [t for t in sc.get("targets", []) if t.get("enabled", True)]
+        next_runs = [
+            str(t["next_run_at"])
+            for t in enabled_targets
+            if t.get("next_run_at")
+        ]
+        enriched.append(
+            {
+                **sc,
+                "within_active_hours": is_within_active_hours(
+                    sc.get("active_hours_start"),
+                    sc.get("active_hours_end"),
+                ),
+                "next_run_at": min(next_runs) if next_runs else None,
+                "live_run": auto_sender.get_scenario_run_status(sid),
+            }
+        )
+    return enriched
 
 
 @router.post("")
@@ -65,13 +87,48 @@ async def delete_scenario(scenario_id: int, request: Request) -> dict[str, Any]:
 
 
 @router.post("/{scenario_id}/run")
-async def run_scenario_now(scenario_id: int, request: Request) -> dict[str, Any]:
+async def run_scenario_now(
+    scenario_id: int,
+    request: Request,
+    wait: bool = False,
+) -> dict[str, Any]:
     auto_sender = request.app.state.auto_sender
     try:
-        logs = await auto_sender.run_scenario_now(scenario_id)
-        return {"scenario_id": scenario_id, "executed_count": len(logs), "logs": logs}
+        if wait:
+            logs = await auto_sender.run_scenario_now(scenario_id)
+            return {
+                "scenario_id": scenario_id,
+                "status": "completed",
+                "background": False,
+                "executed_count": len(logs),
+                "logs": logs,
+            }
+        return await auto_sender.trigger_scenario_background(scenario_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{scenario_id}/run-status")
+async def get_scenario_run_status(scenario_id: int, request: Request) -> dict[str, Any]:
+    store = request.app.state.store
+    auto_sender = request.app.state.auto_sender
+    scenario = store.get_scenario(scenario_id)
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Không tìm thấy kịch bản")
+    live = auto_sender.get_scenario_run_status(scenario_id)
+    return live or {
+        "scenario_id": scenario_id,
+        "scenario_name": scenario["name"],
+        "running": False,
+        "total_destinations": len(expand_scenario_destinations(store, scenario)),
+        "processed": 0,
+        "sent_count": 0,
+        "skipped_count": 0,
+        "failed_count": 0,
+        "started_at": None,
+        "finished_at": None,
+        "last_message": None,
+    }
 
 
 @router.post("/{scenario_id}/clone")
