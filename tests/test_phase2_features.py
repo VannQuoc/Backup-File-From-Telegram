@@ -642,10 +642,171 @@ async def test_smart_distance_delete_and_1000_msg_history_analyzer(
     await auto_sender.run_scenario_now(sc["id"])
     assert 501 in fake_client.deleted_ids
 
-    # Simulate 25 other messages in the group after #505 (msg_counter = 530 -> distance = 25 > 10)
+    # Simulate 25 other messages in the group after #505 (msg_counter = 25 > 10)
     fake_client.msg_counter = 530
     # Run #3: Since distance (25) > 10, message #505 MUST NOT be deleted!
     await auto_sender.run_scenario_now(sc["id"])
     assert 505 not in fake_client.deleted_ids
+
+
+@pytest.mark.asyncio
+async def test_health_check_relogin_and_smart_antispam_and_bulk_invite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from backend.telegram.client_pool import TelegramClientPool
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "data" / "state_relogin.sqlite"))
+    cfg = load_config()
+    store = DatabaseStore(cfg.db_path)
+    pool = TelegramClientPool(store, cfg)
+
+    acc1 = store.create_account(
+        AccountCreateRequest(label="Nick 1 Source", phone="+84911000111"),
+        cfg.sessions_dir,
+    )
+    acc2 = store.create_account(
+        AccountCreateRequest(label="Nick 2 Yao Ming", phone="+84922000222"),
+        cfg.sessions_dir,
+    )
+    # Simulate Nick 2 previously marked as "connected" in DB, but session is now expired/unauthorized
+    store.update_account_status(acc2["id"], "connected", tg_user_id=8900741972)
+
+    async def fake_unauth_client(account_id: int) -> Any:
+        if account_id == acc2["id"]:
+            return None
+        return None
+
+    monkeypatch.setattr(pool, "get_authorized_client", fake_unauth_client)
+
+    # 1) Verify Health Check automatically transitions status from "connected" -> "need_login" when unauthorized
+    health = await pool.check_account_health(acc2["id"])
+    assert health["authorized"] is False
+    assert health["status"] == "need_login"
+    assert store.get_account(acc2["id"])["status"] == "need_login"
+
+    # 2) Verify PeerFlood Quarantine & Automatic Multi-Account Failover in AutoSenderEngine
+    store.upsert_chat_group(
+        ChatGroupUpsertRequest(chat_id=-1007777, title="Group AntiSpam Test", username="antispam_grp")
+    )
+    store.upsert_account_membership(
+        AccountMembershipModel(account_id=acc1["id"], chat_id=-1007777, role="member", can_send_messages=True)
+    )
+    store.upsert_account_membership(
+        AccountMembershipModel(account_id=acc2["id"], chat_id=-1007777, role="member", can_send_messages=True)
+    )
+
+    class PeerFloodClient:
+        async def send_message(self, **kwargs: Any) -> Any:
+            raise RuntimeError("PEER_FLOOD: Too many requests, account limited by Telegram")
+
+    class HealthyClient:
+        async def send_message(self, **kwargs: Any) -> Any:
+            return type("SentMsg", (), {"id": 901})()
+
+    async def fake_pick_client(
+        preferred_account_id: int | None = None,
+        target_chat_id: int | None = None,
+        exclude_account_ids: set[int] | None = None,
+    ) -> Any:
+        excluded = exclude_account_ids or set()
+        if acc1["id"] not in excluded:
+            return acc1["id"], PeerFloodClient()
+        if acc2["id"] not in excluded:
+            return acc2["id"], HealthyClient()
+        return None
+
+    monkeypatch.setattr(pool, "pick_any_authorized_client", fake_pick_client)
+
+    sc = store.create_scenario(
+        ScenarioCreateRequest(
+            name="Scenario AntiSpam Failover",
+            steps=[
+                ScenarioStepInput(
+                    step_order=1,
+                    name="Step 1",
+                    action_type="send_text",
+                    text_content="Xin chào anh em!",
+                )
+            ],
+            targets=[ScenarioTargetInput(target_type="chat", target_id=-1007777)],
+        )
+    )
+    auto_sender = AutoSenderEngine(store, pool, cfg)
+    logs = await auto_sender.run_scenario_now(sc["id"])
+    assert len(logs) == 1
+    assert logs[0]["status"] == "success"
+    assert logs[0]["account_id"] == acc2["id"]  # Failed over from Acc #1 to Acc #2!
+
+    # Verify Acc #1 is now quarantined in flood_wait state and excluded from quota
+    acc1_refreshed = store.get_account(acc1["id"])
+    assert acc1_refreshed["status"] == "flood_wait"
+    within_q, _ = store.is_account_within_quota(acc1["id"])
+    assert within_q is False
+
+    # 3) Verify Smart Bulk Join: Invite-First by Source Account + Share Folder & Manual Pack for remaining
+    store.upsert_chat_group(
+        ChatGroupUpsertRequest(chat_id=-1008881, title="Nhóm Cho Mời", username="nhom_cho_moi")
+    )
+    store.upsert_chat_group(
+        ChatGroupUpsertRequest(chat_id=-1008882, title="Nhóm Cấm Mời", username="nhom_cam_moi")
+    )
+    store.upsert_account_membership(
+        AccountMembershipModel(account_id=acc1["id"], chat_id=-1008881, role="member")
+    )
+    store.upsert_account_membership(
+        AccountMembershipModel(account_id=acc1["id"], chat_id=-1008882, role="member")
+    )
+
+    class FakeSourceClient:
+        async def get_me(self) -> Any:
+            return type("Me", (), {"id": 111, "username": "nick1"})()
+
+        async def get_input_entity(self, peer: Any) -> Any:
+            return peer
+
+        async def __call__(self, req: Any) -> Any:
+            req_name = type(req).__name__
+            if req_name == "ImportContactsRequest":
+                return type("ContactsRes", (), {"users": [type("U", (), {"id": 222})()]})()
+            if req_name == "InviteToChannelRequest":
+                if getattr(req, "channel", None) == -1008881:
+                    return type("Updates", (), {"missing_invitees": []})()
+                raise RuntimeError("CHAT_ADMIN_REQUIRED")
+            if req_name == "ExportChatlistInviteRequest":
+                return type(
+                    "ChatlistInvite",
+                    (),
+                    {"invite": type("Inv", (), {"url": "https://t.me/addlist/AbCdEf123"})()},
+                )()
+            return None
+
+    class FakeTargetClient:
+        async def get_me(self) -> Any:
+            return type("Me", (), {"id": 222, "username": "nick2"})()
+
+    async def fake_auth_for_bulk(account_id: int) -> Any:
+        if account_id == acc1["id"]:
+            return FakeSourceClient()
+        return FakeTargetClient()
+
+    monkeypatch.setattr(pool, "get_authorized_client", fake_auth_for_bulk)
+    monkeypatch.setattr(pool, "scan_account_dialogs", lambda acc_id, limit=250: asyncio.sleep(0, result=[]))
+
+    bulk_res = await pool.bulk_join_chats(
+        acc2["id"],
+        clone_from_account_id=acc1["id"],
+        clone_strategy="invite_only",
+        create_share_folder=True,
+        delay_min_sec=0.01,
+        delay_max_sec=0.02,
+    )
+    assert bulk_res["invited_by_source_count"] == 1
+    assert bulk_res["manual_pack_count"] == 1
+    assert bulk_res["share_folder_link"] == "https://t.me/addlist/AbCdEf123"
+    assert bulk_res["created_web_folder"] is not None
+    assert bulk_res["manual_join_links"][0]["join_link"] == "https://t.me/nhom_cam_moi"
+
 
 

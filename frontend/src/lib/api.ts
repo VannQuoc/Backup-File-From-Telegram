@@ -198,17 +198,35 @@ export const api = {
     payload: {
       links_or_usernames: string[];
       clone_from_account_id?: number | null;
+      clone_strategy?: 'smart_auto' | 'invite_only' | 'share_folder';
+      create_share_folder?: boolean;
+      share_folder_title?: string | null;
+      max_self_joins_per_run?: number;
       delay_min_sec?: number;
       delay_max_sec?: number;
     },
   ) =>
     apiFetch<{
       account_id: number;
+      clone_strategy: string;
       total_targets: number;
       joined_count: number;
+      invited_by_source_count: number;
+      self_joined_count: number;
+      manual_pack_count: number;
       failed_count: number;
-      joined: { target: string; status: string }[];
+      joined: { target: string; status: string; method?: string }[];
+      invited_by_source: { target: string; chat_id: number; title: string; status: string }[];
       failed: { target: string; error: string }[];
+      share_folder_link: string | null;
+      created_web_folder: Folder | null;
+      manual_join_links: {
+        chat_id: number | null;
+        title: string;
+        username: string | null;
+        join_link: string | null;
+        note: string;
+      }[];
     }>(`/api/accounts/${id}/bulk-join`, {
       method: 'POST',
       body: JSON.stringify(payload),

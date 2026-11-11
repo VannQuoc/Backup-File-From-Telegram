@@ -409,9 +409,18 @@ class DatabaseStore:
 
     def get_account_send_counts(self, account_id: int) -> dict[str, int]:
         now = datetime.now(UTC)
+        five_min_ago = (now - timedelta(minutes=5)).replace(microsecond=0).isoformat()
         one_hour_ago = (now - timedelta(hours=1)).replace(microsecond=0).isoformat()
         one_day_ago = (now - timedelta(hours=24)).replace(microsecond=0).isoformat()
         with self._lock:
+            sent_5m = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM execution_logs
+                WHERE account_id = ? AND category = 'auto_send' AND status = 'success'
+                  AND created_at >= ?
+                """,
+                (account_id, five_min_ago),
+            ).fetchone()["c"]
             sent_1h = self._conn.execute(
                 """
                 SELECT COUNT(*) AS c FROM execution_logs
@@ -433,6 +442,7 @@ class DatabaseStore:
                 (account_id,),
             ).fetchone()["c"]
         return {
+            "sent_last_5m": int(sent_5m),
             "sent_last_hour": int(sent_1h),
             "sent_last_24h": int(sent_24h),
             "joined_groups_count": int(joined_groups),
@@ -444,6 +454,24 @@ class DatabaseStore:
             return False, f"Không tìm thấy tài khoản #{account_id}"
         if not acc.get("enabled"):
             return False, "Tài khoản đang bị tắt (disabled)"
+
+        now_iso = utcnow_iso()
+        fw_until = acc.get("flood_wait_until")
+        if fw_until:
+            if str(fw_until) > now_iso:
+                return (
+                    False,
+                    f"Đang tạm nghỉ chống Spam/FloodWait đến {fw_until}",
+                )
+            # Expired cooldown -> auto restore if status was flood_wait
+            if acc.get("status") in ("flood_wait", "spam_limited"):
+                self.update_account_status(
+                    account_id,
+                    "connected",
+                    flood_wait_until=None,
+                    last_error=None,
+                )
+
         counts = acc.get("usage") or self.get_account_send_counts(account_id)
         max_1h = int(acc.get("max_messages_per_hour") or 60)
         max_24h = int(acc.get("max_messages_per_day") or 500)
@@ -452,6 +480,32 @@ class DatabaseStore:
         if counts["sent_last_24h"] >= max_24h:
             return False, f"Đã chạm hạn mức ngày ({counts['sent_last_24h']}/{max_24h} tin/24h)"
         return True, None
+
+    def quarantine_account_flood(
+        self,
+        account_id: int,
+        wait_seconds: int,
+        reason: str,
+        *,
+        status: str = "flood_wait",
+    ) -> str:
+        until_iso = (
+            datetime.now(UTC) + timedelta(seconds=max(10, int(wait_seconds)))
+        ).replace(microsecond=0).isoformat()
+        self.update_account_status(
+            account_id,
+            status,
+            flood_wait_until=until_iso,
+            last_error=f"{reason} (Tạm nghỉ đến {until_iso})",
+        )
+        return until_iso
+
+    def get_known_account_tg_user_ids(self) -> set[int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tg_user_id FROM accounts WHERE tg_user_id IS NOT NULL"
+            ).fetchall()
+        return {int(r["tg_user_id"]) for r in rows if r["tg_user_id"] is not None}
 
     def get_account(self, account_id: int) -> dict[str, Any] | None:
         with self._lock:

@@ -363,26 +363,89 @@ class LearnedErrorResult:
     no_bot_mentions: bool | None = None
     slow_mode_seconds: int | None = None
     flood_wait_seconds: int | None = None
+    is_peer_flood: bool = False
+    session_expired: bool = False
+    account_banned_in_chat: bool = False
     reason_note: str | None = None
+
+
+def apply_anti_spam_text_variation(text: str | None, chat_id: int) -> str:
+    """
+    Applies subtle, invisible/natural variation per target chat so sending the same message
+    across multiple groups does not produce identical SHA-256 content hashes on Telegram's
+    anti-spam filter (while keeping visible text and URLs intact).
+    """
+    if not text or not text.strip():
+        return text or ""
+    # Use a deterministic + random zero-width space / word-joiner pattern between normal words
+    # (never inside a URL or @username) so the message looks 100% identical to human readers
+    # but has a unique byte signature per group.
+    zw_chars = ["\u200b", "\u200c", "\u2060"]
+    words = text.split(" ")
+    if len(words) < 2:
+        return text + random.choice(zw_chars)
+
+    out_words: list[str] = []
+    seed_idx = abs(int(chat_id)) % len(words)
+    for idx, w in enumerate(words):
+        out_words.append(w)
+        # Only insert after plain words (not URLs or @mentions)
+        if (
+            idx < len(words) - 1
+            and not w.startswith(("http", "www.", "t.me/", "@"))
+            and (idx == seed_idx or random.random() < 0.25)
+        ):
+            out_words[-1] = w + random.choice(zw_chars)
+    return " ".join(out_words)
 
 
 def classify_telegram_error(exc: Exception) -> LearnedErrorResult:
     """
     Inspects a Telegram/Telethon exception at runtime and extracts restriction flags
-    so the system can auto-learn group rules into SQLite and immediately retry with fallback.
+    so the system can auto-learn group rules into SQLite, detect PeerFlood/Spam or
+    expired sessions, and immediately retry or failover.
     """
-    err_name = type(exc).__name__
+    err_name = type(exc).__name__.upper()
     err_text = str(exc).upper()
     seconds = getattr(exc, "seconds", None)
 
-    if "FLOODWAIT" in err_name.upper() or "FLOOD_WAIT" in err_text:
+    if (
+        "AUTHKEYUNREGISTERED" in err_name
+        or "AUTH_KEY_UNREGISTERED" in err_text
+        or "SESSIONREVOKED" in err_name
+        or "SESSION_REVOKED" in err_text
+        or "USERDEACTIVATED" in err_name
+        or "USER_DEACTIVATED" in err_text
+        or "AUTH_KEY_DUPLICATED" in err_text
+    ):
         return LearnedErrorResult(
             learned_any_rule=False,
-            flood_wait_seconds=int(seconds or 30),
-            reason_note=f"FloodWait {seconds or 30}s",
+            session_expired=True,
+            reason_note="Phiên đăng nhập Telegram đã hết hạn hoặc bị thu hồi — Cần đăng nhập lại (Re-login)",
         )
 
-    if "SLOWMODEWAIT" in err_name.upper() or "SLOWMODE_WAIT" in err_text:
+    if (
+        "PEERFLOOD" in err_name
+        or "PEER_FLOOD" in err_text
+        or "TOO_MANY_REQUESTS" in err_text
+        or ("SPAM" in err_text and "FLOOD" in err_text)
+    ):
+        return LearnedErrorResult(
+            learned_any_rule=False,
+            is_peer_flood=True,
+            flood_wait_seconds=int(seconds or 10800),  # 3h default quarantine on PeerFlood
+            reason_note="Telegram cảnh báo PeerFlood / Hạn chế Spam tạm thời — Tự động cách ly bảo vệ tài khoản",
+        )
+
+    if "FLOODWAIT" in err_name or "FLOOD_WAIT" in err_text:
+        wait_s = int(seconds or 45)
+        return LearnedErrorResult(
+            learned_any_rule=False,
+            flood_wait_seconds=wait_s,
+            reason_note=f"FloodWait {wait_s}s",
+        )
+
+    if "SLOWMODEWAIT" in err_name or "SLOWMODE_WAIT" in err_text:
         wait_sec = int(seconds or 60)
         return LearnedErrorResult(
             learned_any_rule=True,
@@ -391,7 +454,21 @@ def classify_telegram_error(exc: Exception) -> LearnedErrorResult:
         )
 
     if (
-        "STICKER" in err_name.upper()
+        "USERBANNEDINCHANNEL" in err_name
+        or "USER_BANNED_IN_CHANNEL" in err_text
+        or "CHATWRITEFORBIDDEN" in err_name
+        or "CHAT_WRITE_FORBIDDEN" in err_text
+        or "CHANNELPRIVATE" in err_name
+        or "CHANNEL_PRIVATE" in err_text
+    ):
+        return LearnedErrorResult(
+            learned_any_rule=False,
+            account_banned_in_chat=True,
+            reason_note="Tài khoản bị hạn chế quyền chat hoặc bị khóa nhắn tin trong nhóm này",
+        )
+
+    if (
+        "STICKER" in err_name
         or "CHAT_SEND_STICKERS_FORBIDDEN" in err_text
         or "CHAT_SEND_GIFS_FORBIDDEN" in err_text
     ):
@@ -404,7 +481,7 @@ def classify_telegram_error(exc: Exception) -> LearnedErrorResult:
     if (
         "FORWARDS_RESTRICTED" in err_text
         or "CHAT_FORWARDS_RESTRICTED" in err_text
-        or "CHATFORWARDSRESTRICTED" in err_name.upper()
+        or "CHATFORWARDSRESTRICTED" in err_name
     ):
         return LearnedErrorResult(
             learned_any_rule=True,
@@ -418,7 +495,7 @@ def classify_telegram_error(exc: Exception) -> LearnedErrorResult:
         or "CHAT_SEND_PHOTOS_FORBIDDEN" in err_text
         or "CHAT_SEND_VIDEOS_FORBIDDEN" in err_text
         or "CHAT_SEND_DOCS_FORBIDDEN" in err_text
-        or "CHATSENDMEDIAFORBIDDEN" in err_name.upper()
+        or "CHATSENDMEDIAFORBIDDEN" in err_name
     ):
         return LearnedErrorResult(
             learned_any_rule=True,

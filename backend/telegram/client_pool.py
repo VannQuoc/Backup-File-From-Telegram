@@ -161,25 +161,53 @@ class TelegramClientPool:
                 client = self._clients.get(account_id)
             except Exception as exc:
                 logger.warning("Lỗi kết nối account #%s: %s", account_id, exc)
+                self._store.update_account_status(
+                    account_id,
+                    "need_login",
+                    last_error=f"Không thể kết nối phiên Telethon: {exc}",
+                )
                 return None
 
-        if client and client.is_connected() and await client.is_user_authorized():
-            return client
+        if client is not None:
+            try:
+                if not client.is_connected():
+                    await client.connect()
+                if await client.is_user_authorized():
+                    return client
+                # Not authorized -> ensure DB reflects need_login (unless mid-OTP flow)
+                cur_acc = self._store.get_account(account_id) or account
+                if cur_acc.get("status") not in ("otp_sent", "need_2fa"):
+                    self._store.update_account_status(
+                        account_id,
+                        "need_login",
+                        last_error="Chưa kết nối hoặc phiên đăng nhập hết hạn — Cần đăng nhập lại (OTP)",
+                    )
+            except Exception as exc:
+                logger.warning("Phiên đăng nhập account #%s lỗi hoặc hết hạn: %s", account_id, exc)
+                self._store.update_account_status(
+                    account_id,
+                    "need_login",
+                    last_error=f"Phiên đăng nhập hết hạn hoặc lỗi: {exc}",
+                )
+                return None
         return None
 
     async def pick_any_authorized_client(
         self,
         preferred_account_id: int | None = None,
         target_chat_id: int | None = None,
+        exclude_account_ids: set[int] | None = None,
     ) -> tuple[int, TelegramClient] | None:
         """
         Smart Account Rotation & Membership-Aware Failover:
-        1. If `preferred_account_id` is specified, within quota, and connected -> use it.
+        1. If `preferred_account_id` is specified, not excluded, within quota, and connected -> use it.
         2. If `target_chat_id` is specified -> prioritize accounts known to be members (`can_send_messages=True`)
-           and within quota, sorted by least messages sent in the last hour.
+           and within quota, sorted by least messages sent in the last 5m & 1h.
         3. Otherwise -> pick any connected account within quota.
         """
-        if preferred_account_id is not None:
+        excluded = exclude_account_ids or set()
+
+        if preferred_account_id is not None and preferred_account_id not in excluded:
             within_quota, _ = self._store.is_account_within_quota(preferred_account_id)
             if within_quota:
                 client = await self.get_authorized_client(preferred_account_id)
@@ -190,27 +218,40 @@ class TelegramClientPool:
             member_rows = self._store.get_member_accounts_for_chat(
                 target_chat_id, require_send_permission=True
             )
-            # Sort by least sent in last hour for balanced load rotation
-            candidates: list[tuple[int, int]] = []
+            # Sort by (sent_last_5m, sent_last_hour) for balanced anti-spam load rotation
+            candidates: list[tuple[int, int, int]] = []
             for m in member_rows:
                 acc_id = int(m["account_id"])
+                if acc_id in excluded:
+                    continue
                 within_quota, _ = self._store.is_account_within_quota(acc_id)
                 if within_quota:
                     counts = self._store.get_account_send_counts(acc_id)
-                    candidates.append((counts["sent_last_hour"], acc_id))
-            candidates.sort(key=lambda x: x[0])
-            for _, acc_id in candidates:
+                    candidates.append(
+                        (counts.get("sent_last_5m", 0), counts["sent_last_hour"], acc_id)
+                    )
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            for _, _, acc_id in candidates:
                 client = await self.get_authorized_client(acc_id)
                 if client:
                     return acc_id, client
 
-        # Fallback: any enabled & connected account within quota
+        # Fallback: any enabled & connected account within quota, sorted by least recent load
         all_enabled = self._store.list_accounts(enabled_only=True)
+        fallback_candidates: list[tuple[int, int, int]] = []
         for acc in all_enabled:
             acc_id = int(acc["id"])
+            if acc_id in excluded:
+                continue
             within_quota, _ = self._store.is_account_within_quota(acc_id)
             if not within_quota:
                 continue
+            counts = self._store.get_account_send_counts(acc_id)
+            fallback_candidates.append(
+                (counts.get("sent_last_5m", 0), counts["sent_last_hour"], acc_id)
+            )
+        fallback_candidates.sort(key=lambda x: (x[0], x[1]))
+        for _, _, acc_id in fallback_candidates:
             client = await self.get_authorized_client(acc_id)
             if client:
                 return acc_id, client
@@ -233,21 +274,48 @@ class TelegramClientPool:
             if not client.is_connected():
                 await client.connect()
 
-            if await client.is_user_authorized():
-                me = await client.get_me()
-                self._store.update_account_status(
-                    account_id,
-                    "connected",
-                    tg_user_id=getattr(me, "id", None),
-                    tg_username=getattr(me, "username", None),
-                )
-                return {
-                    "status": "already_connected",
-                    "message": "Tài khoản này đã được đăng nhập sẵn.",
-                    "account": self._store.get_account(account_id),
-                }
+            try:
+                if await client.is_user_authorized():
+                    me = await client.get_me()
+                    if me is not None:
+                        self._store.update_account_status(
+                            account_id,
+                            "connected",
+                            tg_user_id=getattr(me, "id", None),
+                            tg_username=getattr(me, "username", None),
+                            last_error=None,
+                        )
+                        return {
+                            "status": "already_connected",
+                            "message": "Tài khoản này đã được đăng nhập sẵn.",
+                            "account": self._store.get_account(account_id),
+                        }
+            except Exception as auth_exc:
+                logger.info("Phiên cũ của account #%s cần khởi tạo lại khi gửi OTP: %s", account_id, auth_exc)
 
-            sent = await client.send_code_request(phone)
+            try:
+                sent = await client.send_code_request(phone)
+            except Exception as send_exc:
+                # If the old .session file had a revoked/corrupted auth key, reset session file and retry once
+                logger.warning("Thử reset session cũ của account #%s do lỗi gửi OTP (%s)", account_id, send_exc)
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                except Exception as disc_exc:
+                    logger.debug("Disconnect old session warning: %s", disc_exc)
+                session_path = Path(account["session_path"])
+                for suffix in ("", ".session", ".session-journal"):
+                    candidate = session_path if not suffix else session_path.with_suffix(suffix)
+                    if candidate.exists():
+                        try:
+                            candidate.unlink()
+                        except Exception as ul_exc:
+                            logger.debug("Unlink dead session warning: %s", ul_exc)
+                client = self._build_client(account)
+                self._clients[account_id] = client
+                await client.connect()
+                sent = await client.send_code_request(phone)
+
             self._pending_phone_hashes[account_id] = (phone, sent.phone_code_hash)
             self._store.update_account_status(account_id, "otp_sent", last_error=None)
             return {
@@ -673,39 +741,378 @@ class TelegramClientPool:
         return imported_folders
 
     # -------------------------------------------------------------------------
-    # BULK JOIN & CLONE GROUP MEMBERSHIPS
+    # BULK JOIN & CLONE GROUP MEMBERSHIPS (SMART INVITE-FIRST + SHARE FOLDER)
     # -------------------------------------------------------------------------
+    async def _resolve_target_user_for_source_client(
+        self,
+        source_client: Any,
+        target_client: Any,
+        target_account: dict[str, Any],
+    ) -> Any | None:
+        """
+        Resolves the Target Account as an InputUser on `source_client` so Source Account
+        can directly invite Target Account (`InviteToChannelRequest` / `AddChatUserRequest`).
+        Also imports Target Account's phone into Source Account's contacts if needed,
+        making them mutual contacts to reduce Telegram's anti-spam blocks.
+        """
+        try:
+            me_target = await target_client.get_me() if hasattr(target_client, "get_me") else None
+            target_username = getattr(me_target, "username", None) or target_account.get("tg_username")
+            target_user_id = getattr(me_target, "id", None) or target_account.get("tg_user_id")
+            target_phone = str(target_account.get("phone") or "").strip()
+
+            # 1. Try importing phone contact first so Source & Target become contacts
+            if target_phone and callable(source_client):
+                try:
+                    contact_res = await source_client(
+                        functions.contacts.ImportContactsRequest(
+                            contacts=[
+                                types.InputPhoneContact(
+                                    client_id=random.randint(1, 999999),
+                                    phone=target_phone,
+                                    first_name=str(target_account.get("label") or "Member"),
+                                    last_name="",
+                                )
+                            ]
+                        )
+                    )
+                    users = getattr(contact_res, "users", None) or []
+                    if users and hasattr(source_client, "get_input_entity"):
+                        return await source_client.get_input_entity(users[0])
+                    if users:
+                        return users[0]
+                except Exception as exc:
+                    logger.debug("ImportContactsRequest fallback: %s", exc)
+
+            # 2. Try resolving by @username
+            if target_username and hasattr(source_client, "get_input_entity"):
+                try:
+                    return await source_client.get_input_entity(f"@{str(target_username).lstrip('@')}")
+                except Exception as exc:
+                    logger.debug("get_input_entity(@username) fallback: %s", exc)
+
+            # 3. Try resolving by user_id
+            if target_user_id and hasattr(source_client, "get_input_entity"):
+                try:
+                    return await source_client.get_input_entity(int(target_user_id))
+                except Exception as exc:
+                    logger.debug("get_input_entity(user_id) fallback: %s", exc)
+        except Exception as exc:
+            logger.debug("_resolve_target_user_for_source_client warning: %s", exc)
+        return None
+
+    async def _try_export_chatlist_share_link(
+        self,
+        source_client: Any,
+        peers: list[Any],
+        folder_title: str,
+    ) -> str | None:
+        """
+        Attempts to export a Telegram Shared Folder invite link (`t.me/addlist/...`)
+        on `source_client` so the target account can manually join all groups in 1 tap.
+        """
+        if not peers or not callable(source_client):
+            return None
+        try:
+            chatlists_ns = getattr(functions, "chatlists", None)
+            if chatlists_ns is None or not hasattr(chatlists_ns, "ExportChatlistInviteRequest"):
+                return None
+
+            # Find an unused filter_id (between 2 and 254)
+            filter_id = random.randint(100, 240)
+            input_chatlist_cls = getattr(types, "InputChatlistDialogFilter", None)
+            if input_chatlist_cls is None:
+                return None
+
+            res = await source_client(
+                chatlists_ns.ExportChatlistInviteRequest(
+                    chatlist=input_chatlist_cls(filter_id=filter_id),
+                    title=folder_title[:30],
+                    peers=peers[:95],
+                )
+            )
+            invite = getattr(res, "invite", None)
+            url = getattr(invite, "url", None) or getattr(res, "url", None)
+            if url:
+                return str(url)
+        except Exception as exc:
+            logger.debug("ExportChatlistInviteRequest không khả dụng cho danh sách nhóm này: %s", exc)
+        return None
+
     async def bulk_join_chats(
         self,
         account_id: int,
         *,
         links_or_usernames: list[str] | None = None,
         clone_from_account_id: int | None = None,
-        delay_min_sec: float = 2.0,
-        delay_max_sec: float = 5.0,
+        clone_strategy: str = "smart_auto",
+        create_share_folder: bool = True,
+        share_folder_title: str | None = None,
+        max_self_joins_per_run: int = 8,
+        delay_min_sec: float = 3.0,
+        delay_max_sec: float = 7.0,
     ) -> dict[str, Any]:
         """
-        Joins multiple public `@username` / `t.me/...` / `t.me/+invite` links,
-        or clones public group memberships from another account.
+        Smart Bulk Join & Group Cloning:
+        1. When cloning from `clone_from_account_id`:
+           - Priority 1 (`smart_auto` / `invite_only`): If the source account can invite members,
+             use the SOURCE account to directly INVITE `account_id` into the group
+             (`InviteToChannelRequest` / `AddChatUserRequest`) -> avoids `JoinChannel` rate limits
+             and works even for private groups!
+           - Priority 2 (`smart_auto`): If direct invite is blocked by group rules, try exporting
+             an invite link (`ExportChatInviteRequest`) or using `@username`, and let `account_id`
+             join up to `max_self_joins_per_run` with anti-spam delays.
+           - Priority 3 (`share_folder` / fallback): Generate a Shareable Folder (`t.me/addlist/...`
+             when supported by Telegram + a Web Panel Folder) and a `manual_join_links` pack so
+             the user can join manually in 1 click without risking account bans.
+        2. Also processes explicit `links_or_usernames` provided by the user.
         """
-        client = await self.get_authorized_client(account_id)
-        if not client:
-            raise ValueError(f"Tài khoản #{account_id} chưa kết nối Telegram.")
+        target_account = self._store.get_account(account_id)
+        if not target_account:
+            raise ValueError(f"Không tìm thấy tài khoản #{account_id}")
 
-        targets: list[str] = [s.strip() for s in (links_or_usernames or []) if s and s.strip()]
+        client = await self.get_authorized_client(account_id)
+        if not client and clone_strategy != "share_folder":
+            raise ValueError(
+                f"Tài khoản đích #{account_id} ({target_account['label']}) chưa kết nối hoặc phiên đã hết hạn. "
+                "Hãy đăng nhập lại (OTP) hoặc chọn chế độ 'Share Folder / Xuất Link Tự Join Thủ Công'."
+            )
+
+        joined: list[dict[str, Any]] = []
+        invited_by_source: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+        manual_join_links: list[dict[str, Any]] = []
+        share_folder_link: str | None = None
+        created_web_folder: dict[str, Any] | None = None
+
+        existing_target_chat_ids = {
+            int(c["chat_id"]) for c in self._store.list_chat_groups(account_id=account_id)
+        }
+        self_joins_done = 0
+        target_flood_waited = False
+
+        # ---------------------------------------------------------------------
+        # STEP 1: CLONE FROM SOURCE ACCOUNT (INVITE-FIRST -> LINK -> SHARE FOLDER)
+        # ---------------------------------------------------------------------
+        explicit_targets: list[str] = [
+            s.strip() for s in (links_or_usernames or []) if s and s.strip()
+        ]
+
         if clone_from_account_id is not None:
             source_chats = self._store.list_chat_groups(account_id=clone_from_account_id)
-            for ch in source_chats:
-                uname = ch.get("username")
-                if uname and str(uname).strip():
-                    targets.append(f"@{str(uname).strip().lstrip('@')}")
+            source_client = await self.get_authorized_client(clone_from_account_id)
+            target_input_user = None
+            if source_client and client and clone_strategy in ("smart_auto", "invite_only"):
+                target_input_user = await self._resolve_target_user_for_source_client(
+                    source_client, client, target_account
+                )
 
-        # Deduplicate while preserving order
-        deduped_targets = list(dict.fromkeys(targets))
-        joined: list[dict[str, Any]] = []
-        failed: list[dict[str, str]] = []
+            share_peers: list[Any] = []
+            folder_chat_entries: list[FolderChatEntry] = []
 
+            for idx, ch in enumerate(source_chats):
+                chat_id = int(ch["chat_id"])
+                title = str(ch.get("title") or f"Chat {chat_id}")
+                uname = str(ch.get("username") or "").strip().lstrip("@")
+                chat_type = str(ch.get("chat_type") or "supergroup")
+
+                if chat_id in existing_target_chat_ids:
+                    continue
+
+                folder_chat_entries.append(FolderChatEntry(chat_id=chat_id, topic_id=0))
+
+                src_entity: Any = chat_id
+                if source_client and hasattr(source_client, "get_input_entity"):
+                    try:
+                        src_entity = await source_client.get_input_entity(chat_id)
+                        share_peers.append(src_entity)
+                    except Exception:
+                        src_entity = chat_id
+
+                # 1A) Priority 1: Direct Invite by Source Account (`InviteToChannelRequest` / `AddChatUserRequest`)
+                if (
+                    clone_strategy in ("smart_auto", "invite_only")
+                    and source_client is not None
+                    and target_input_user is not None
+                ):
+                    try:
+                        if chat_type == "group":
+                            inv_res = await source_client(
+                                functions.messages.AddChatUserRequest(
+                                    chat_id=abs(chat_id),
+                                    user_id=target_input_user,
+                                    fwd_limit=20,
+                                )
+                            )
+                        else:
+                            inv_res = await source_client(
+                                functions.channels.InviteToChannelRequest(
+                                    channel=src_entity,
+                                    users=[target_input_user],
+                                )
+                            )
+                        missing = getattr(inv_res, "missing_invitees", None) or []
+                        if not missing:
+                            item = {
+                                "target": f"{title} ({chat_id})",
+                                "chat_id": chat_id,
+                                "title": title,
+                                "method": "invited_by_source",
+                                "status": "invited",
+                            }
+                            invited_by_source.append(item)
+                            joined.append(item)
+                            await asyncio.sleep(
+                                random.uniform(
+                                    max(1.0, delay_min_sec),
+                                    max(delay_min_sec + 1.0, delay_max_sec),
+                                )
+                            )
+                            continue
+                    except Exception as invite_exc:
+                        logger.debug(
+                            "Không thể dùng nick #%s mời trực tiếp vào nhóm %s (%s): %s",
+                            clone_from_account_id,
+                            title,
+                            chat_id,
+                            invite_exc,
+                        )
+
+                # 1B) Discover or Export Invite Link (`https://t.me/+...` or `https://t.me/username`)
+                best_link: str | None = f"https://t.me/{uname}" if uname else None
+                if not best_link and source_client is not None:
+                    try:
+                        exp = await source_client(
+                            functions.messages.ExportChatInviteRequest(peer=src_entity)
+                        )
+                        exp_link = getattr(exp, "link", None)
+                        if exp_link:
+                            best_link = str(exp_link)
+                    except Exception as exp_exc:
+                        logger.debug("ExportChatInviteRequest fallback: %s", exp_exc)
+
+                # 1C) Priority 2: If `smart_auto`, no source client/direct invite failed, and within safe self-join cap
+                if (
+                    clone_strategy == "smart_auto"
+                    and client is not None
+                    and best_link
+                    and not target_flood_waited
+                    and self_joins_done < max_self_joins_per_run
+                ):
+                    try:
+                        inv_match = INVITE_LINK_REGEX.search(best_link)
+                        if inv_match:
+                            await client(
+                                functions.messages.ImportChatInviteRequest(
+                                    hash=inv_match.group(1)
+                                )
+                            )
+                        else:
+                            clean_u = uname or best_link.rsplit("/", 1)[-1].lstrip("@")
+                            await client(functions.channels.JoinChannelRequest(channel=clean_u))
+
+                        self_joins_done += 1
+                        joined.append(
+                            {
+                                "target": f"@{uname}" if uname else best_link,
+                                "chat_id": chat_id,
+                                "title": title,
+                                "method": "self_join",
+                                "status": "joined",
+                            }
+                        )
+                        # Adaptive anti-spam pause between self-joins
+                        pause_s = random.uniform(
+                            max(1.0, delay_min_sec), max(delay_min_sec, delay_max_sec)
+                        )
+                        if self_joins_done % 4 == 0:
+                            pause_s += random.uniform(8.0, 15.0)
+                        if idx < len(source_chats) - 1:
+                            await asyncio.sleep(pause_s)
+                        continue
+                    except Exception as join_exc:
+                        err_up = str(join_exc).upper()
+                        if "FLOOD" in err_up or "TOO_MANY" in err_up:
+                            target_flood_waited = True
+                        failed.append(
+                            {
+                                "target": f"{title} ({best_link})",
+                                "error": str(join_exc),
+                            }
+                        )
+
+                # 1D) Priority 3: Add to Manual Join / Share Folder Pack
+                manual_join_links.append(
+                    {
+                        "chat_id": chat_id,
+                        "title": title,
+                        "username": uname or None,
+                        "join_link": best_link,
+                        "note": (
+                            "Sẵn sàng mở link tự Join thủ công"
+                            if best_link
+                            else "Nhóm kín không cho tạo link mời (Cần Admin cấp link)"
+                        ),
+                    }
+                )
+
+            # Try exporting native Telegram Shared Folder (`t.me/addlist/...`) if requested or needed
+            if (create_share_folder or clone_strategy == "share_folder") and source_client:
+                folder_label = (
+                    share_folder_title
+                    or f"Share #{clone_from_account_id} -> #{account_id}"
+                )
+                share_folder_link = await self._try_export_chatlist_share_link(
+                    source_client, share_peers, folder_label
+                )
+
+            # Also create/update a Web Panel Folder so the user has the cloned group set saved
+            if (create_share_folder or clone_strategy == "share_folder") and folder_chat_entries:
+                base_folder_name = (
+                    share_folder_title
+                    or f"[Share Clone #{clone_from_account_id}→#{account_id}] ({len(folder_chat_entries)} nhóm)"
+                )
+                try:
+                    created_web_folder = self._store.create_folder(
+                        FolderCreateRequest(
+                            name=base_folder_name[:95],
+                            color="#10B981",
+                            description=(
+                                f"Folder nhóm sao chép từ nick #{clone_from_account_id} sang nick #{account_id}. "
+                                + (
+                                    f"Link Share Folder TG: {share_folder_link}"
+                                    if share_folder_link
+                                    else "Dùng danh sách link để tự join thủ công an toàn."
+                                )
+                            ),
+                            enabled=True,
+                            chats=folder_chat_entries,
+                        )
+                    )
+                except Exception as fld_exc:
+                    logger.debug("Create web folder for share clone warning: %s", fld_exc)
+
+        # ---------------------------------------------------------------------
+        # STEP 2: EXPLICIT LINKS OR USERNAMES PROVIDED BY USER
+        # ---------------------------------------------------------------------
+        deduped_targets = list(dict.fromkeys(explicit_targets))
         for idx, raw_target in enumerate(deduped_targets):
+            if clone_strategy == "share_folder" or client is None or target_flood_waited:
+                manual_join_links.append(
+                    {
+                        "chat_id": None,
+                        "title": raw_target,
+                        "username": raw_target.lstrip("@") if raw_target.startswith("@") else None,
+                        "join_link": (
+                            raw_target
+                            if raw_target.startswith("http")
+                            else f"https://t.me/{raw_target.lstrip('@')}"
+                        ),
+                        "note": "Link tự Join thủ công",
+                    }
+                )
+                continue
+
             try:
                 invite_match = INVITE_LINK_REGEX.search(raw_target)
                 if invite_match:
@@ -713,34 +1120,73 @@ class TelegramClientPool:
                     await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
                 else:
                     uname_match = USERNAME_LINK_REGEX.search(raw_target)
-                    clean_target = uname_match.group(1) if uname_match else raw_target.lstrip("@").strip()
+                    clean_target = (
+                        uname_match.group(1) if uname_match else raw_target.lstrip("@").strip()
+                    )
                     await client(functions.channels.JoinChannelRequest(channel=clean_target))
 
-                joined.append({"target": raw_target, "status": "joined"})
+                self_joins_done += 1
+                joined.append(
+                    {
+                        "target": raw_target,
+                        "method": "self_join",
+                        "status": "joined",
+                    }
+                )
             except Exception as exc:
+                if "FLOOD" in str(exc).upper():
+                    target_flood_waited = True
                 failed.append({"target": raw_target, "error": str(exc)})
+                manual_join_links.append(
+                    {
+                        "chat_id": None,
+                        "title": raw_target,
+                        "username": None,
+                        "join_link": (
+                            raw_target
+                            if raw_target.startswith("http")
+                            else f"https://t.me/{raw_target.lstrip('@')}"
+                        ),
+                        "note": f"Auto-join lỗi ({exc}) -> Hãy mở link tự Join thủ công",
+                    }
+                )
 
             if idx < len(deduped_targets) - 1:
-                await asyncio.sleep(random.uniform(max(0.5, delay_min_sec), max(delay_min_sec, delay_max_sec)))
+                await asyncio.sleep(
+                    random.uniform(max(0.5, delay_min_sec), max(delay_min_sec, delay_max_sec))
+                )
 
-        if joined:
+        if joined and client is not None:
             try:
                 await self.scan_account_dialogs(account_id, limit=250)
             except Exception as exc:
                 logger.debug("Re-scan after bulk join warning: %s", exc)
 
+        total_considered = len(joined) + len(failed) + len(manual_join_links)
         self._store.add_execution_log(
             category="account",
             account_id=account_id,
-            message=f"Bulk Join hoàn tất cho tài khoản #{account_id}: Thành công {len(joined)}, lỗi {len(failed)}.",
+            message=(
+                f"Bulk Join / Clone cho nick #{account_id}: "
+                f"Đã vào {len(joined)} nhóm (Mời trực tiếp: {len(invited_by_source)}, Tự join: {self_joins_done}), "
+                f"Link tự join thủ công: {len(manual_join_links)}, Lỗi: {len(failed)}."
+            ),
         )
         return {
             "account_id": account_id,
-            "total_targets": len(deduped_targets),
+            "clone_strategy": clone_strategy,
+            "total_targets": total_considered,
             "joined_count": len(joined),
+            "invited_by_source_count": len(invited_by_source),
+            "self_joined_count": self_joins_done,
+            "manual_pack_count": len(manual_join_links),
             "failed_count": len(failed),
             "joined": joined,
+            "invited_by_source": invited_by_source,
             "failed": failed,
+            "share_folder_link": share_folder_link,
+            "created_web_folder": created_web_folder,
+            "manual_join_links": manual_join_links,
         }
 
     # -------------------------------------------------------------------------
@@ -814,21 +1260,41 @@ class TelegramClientPool:
             client = await self.get_authorized_client(account_id)
             if client:
                 me = await client.get_me()
-                latency_ms = int((time.perf_counter() - start_ts) * 1000)
-                authorized = True
-                username = getattr(me, "username", None)
-                user_id = getattr(me, "id", None)
-                self._store.update_account_status(
-                    account_id,
-                    "connected",
-                    tg_user_id=user_id,
-                    tg_username=username,
-                    last_error=None,
-                )
+                if me is not None:
+                    latency_ms = int((time.perf_counter() - start_ts) * 1000)
+                    authorized = True
+                    username = getattr(me, "username", None)
+                    user_id = getattr(me, "id", None)
+                    self._store.update_account_status(
+                        account_id,
+                        "connected",
+                        tg_user_id=user_id,
+                        tg_username=username,
+                        last_error=None,
+                    )
+                else:
+                    error_note = "Phiên đăng nhập không trả về thông tin user — Cần đăng nhập lại (OTP)"
+                    self._store.update_account_status(
+                        account_id,
+                        "need_login",
+                        last_error=error_note,
+                    )
             else:
-                error_note = "Chưa kết nối hoặc phiên đăng nhập hết hạn"
+                error_note = "Chưa kết nối hoặc phiên đăng nhập hết hạn — Vui lòng đăng nhập lại (OTP)"
+                cur_status = (self._store.get_account(account_id) or account).get("status")
+                if cur_status not in ("otp_sent", "need_2fa"):
+                    self._store.update_account_status(
+                        account_id,
+                        "need_login",
+                        last_error=error_note,
+                    )
         except Exception as exc:
             error_note = str(exc)
+            self._store.update_account_status(
+                account_id,
+                "need_login",
+                last_error=f"Lỗi kiểm tra phiên đăng nhập: {error_note}",
+            )
 
         now_iso = datetime.now(UTC).replace(microsecond=0).isoformat()
         with self._store.transaction() as conn:
@@ -851,6 +1317,7 @@ class TelegramClientPool:
             "tg_username": username,
             "within_quota": within_quota,
             "quota_note": quota_reason,
+            "sent_last_5m": counts.get("sent_last_5m", 0),
             "sent_last_hour": counts["sent_last_hour"],
             "sent_last_24h": counts["sent_last_24h"],
             "max_messages_per_hour": refreshed.get("max_messages_per_hour", 60),

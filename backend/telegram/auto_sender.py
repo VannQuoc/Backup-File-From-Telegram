@@ -11,14 +11,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from telethon import types
+from telethon import functions, types
 from telethon import utils as tg_utils
 
 from backend.config import AppConfig
 from backend.database.db import DatabaseStore
+from backend.database.models import AccountMembershipModel
 from backend.telegram.client_pool import TelegramClientPool
 from backend.telegram.rule_engine import (
     ResolvedSendPlan,
+    apply_anti_spam_text_variation,
     classify_telegram_error,
     is_within_active_hours,
     resolve_execution_plan,
@@ -318,11 +320,17 @@ class AutoSenderEngine:
         if not destinations:
             return []
 
+        # Smart Anti-Spam: Shuffle destination order when sending to multiple groups
+        # so accounts never hit groups in a robotic, deterministic timestamp sequence.
+        is_multi_dest = len(destinations) > 1
+        if is_multi_dest:
+            random.shuffle(destinations)
+
         preferred_acc_id = scenario.get("sender_account_id")
         execution_records: list[dict[str, Any]] = []
         sent_counter = 0
 
-        for dest in destinations:
+        for dest_idx, dest in enumerate(destinations):
             chat_id = int(dest["chat_id"])
             topic_id = int(dest.get("topic_id") or 0)
             override_text = dest.get("override_text_content")
@@ -345,7 +353,7 @@ class AutoSenderEngine:
                     status="failed",
                     message=(
                         f"Kịch bản '{scenario['name']}' tạm hoãn gửi tới nhóm {chat_id}: "
-                        "Không có tài khoản nào kết nối hoặc tất cả đã chạm hạn mức Quota."
+                        "Không có tài khoản nào kết nối hoặc tất cả đang tạm nghỉ chống Spam / chạm hạn mức Quota."
                     ),
                 )
                 execution_records.append(log)
@@ -361,13 +369,22 @@ class AutoSenderEngine:
                     chat_id=chat_id,
                     topic_id=topic_id,
                     override_text_content=override_text,
+                    apply_hash_variation=is_multi_dest,
                 )
                 execution_records.append(rec)
                 if rec.get("status") == "success":
                     sent_counter += 1
 
-                if len(destinations) > 1:
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
+                if is_multi_dest and dest_idx < len(destinations) - 1:
+                    is_real_tg = type(client).__name__ == "TelegramClient"
+                    if is_real_tg:
+                        # Adaptive Anti-Spam Pacing: 3.5s - 7.5s between groups, plus a 12-20s micro-break every 5 groups
+                        delay_s = random.uniform(3.5, 7.5)
+                        if (dest_idx + 1) % 5 == 0:
+                            delay_s += random.uniform(12.0, 20.0)
+                        await asyncio.sleep(delay_s)
+                    else:
+                        await asyncio.sleep(random.uniform(0.05, 0.15))
 
         next_run_iso = compute_next_run_iso(scenario, target)
         self._store.advance_scenario_target_schedule(
@@ -490,6 +507,26 @@ class AutoSenderEngine:
             logger.debug("Không thể xóa tin nhắn cũ #%s trong nhóm %s: %s", last_msg_id, chat_id, exc)
         return False
 
+    async def _simulate_human_typing(self, client: Any, chat_id: int, text: str | None) -> None:
+        """
+        Sends a realistic `SetTypingRequest` before dispatching a message on real Telethon
+        clients so Telegram's behavioral anti-spam filter sees human-like typing activity.
+        """
+        if type(client).__name__ != "TelegramClient" or not callable(client):
+            return
+        try:
+            await client(
+                functions.messages.SetTypingRequest(
+                    peer=chat_id,
+                    action=types.SendMessageTypingAction(),
+                )
+            )
+            char_len = len(text or "")
+            typing_sec = min(2.4, max(0.8, char_len / 65.0))
+            await asyncio.sleep(random.uniform(0.7, typing_sec))
+        except Exception as exc:
+            logger.debug("SetTypingRequest fallback: %s", exc)
+
     async def _send_step_to_chat(
         self,
         *,
@@ -500,6 +537,7 @@ class AutoSenderEngine:
         chat_id: int,
         topic_id: int,
         override_text_content: str | None = None,
+        apply_hash_variation: bool = False,
     ) -> dict[str, Any]:
         scenario_id = int(scenario["id"])
         attempted_action = str(step.get("action_type") or "send_text")
@@ -535,6 +573,10 @@ class AutoSenderEngine:
                 status="skipped",
                 message=f"Bỏ qua gửi tới nhóm {chat_id}: {plan.fallback_reason_summary}",
             )
+
+        # Apply subtle anti-hash perturbation when sending across multiple groups
+        if apply_hash_variation and plan.text_content:
+            plan.text_content = apply_anti_spam_text_variation(plan.text_content, chat_id)
 
         # Smart Anti-Spam Distance Check (`skip_if_within_x_messages` & `delete_if_within_x_messages`)
         skip_within_x = int(scenario.get("skip_if_within_x_messages") or 0)
@@ -583,6 +625,7 @@ class AutoSenderEngine:
             )
 
         try:
+            await self._simulate_human_typing(client, chat_id, plan.text_content)
             sent_msg_id = await self._dispatch_plan_via_telethon(
                 client, chat_id, topic_id, plan, chat_rule.no_media
             )
@@ -612,8 +655,93 @@ class AutoSenderEngine:
                 ),
             )
         except Exception as first_exc:
-            # LAYER 2: Runtime Error Auto-Learn & Instant Fallback Retry
             learned = classify_telegram_error(first_exc)
+
+            # 1) Account Session Expired -> Switch status to `need_login` immediately!
+            if learned.session_expired:
+                self._store.update_account_status(
+                    account_id,
+                    "need_login",
+                    last_error=learned.reason_note or str(first_exc),
+                )
+
+            # 2) PeerFlood / FloodWait -> Quarantine account to protect from permanent Telegram ban!
+            if learned.is_peer_flood or learned.flood_wait_seconds:
+                wait_sec = int(learned.flood_wait_seconds or (10800 if learned.is_peer_flood else 60))
+                self._store.quarantine_account_flood(
+                    account_id,
+                    wait_sec,
+                    learned.reason_note or f"FloodWait/PeerFlood ({wait_sec}s)",
+                    status="flood_wait",
+                )
+
+            # 3) Account muted/banned in this specific group -> Mark `can_send_messages=False`
+            if learned.account_banned_in_chat:
+                self._store.upsert_account_membership(
+                    AccountMembershipModel(
+                        account_id=account_id,
+                        chat_id=chat_id,
+                        role="restricted",
+                        can_send_messages=False,
+                        can_send_media=False,
+                        can_send_stickers=False,
+                        can_embed_links=False,
+                    )
+                )
+
+            # 4) Instant Multi-Account Failover if current account had session/flood/ban issue
+            if (
+                learned.session_expired
+                or learned.is_peer_flood
+                or learned.flood_wait_seconds
+                or learned.account_banned_in_chat
+            ):
+                try:
+                    failover = await self._pool.pick_any_authorized_client(
+                        preferred_account_id=None,
+                        target_chat_id=chat_id,
+                        exclude_account_ids={account_id},
+                    )
+                except TypeError:
+                    failover = None
+
+                if failover:
+                    alt_acc_id, alt_client = failover
+                    try:
+                        await self._simulate_human_typing(alt_client, chat_id, plan.text_content)
+                        sent_msg_id = await self._dispatch_plan_via_telethon(
+                            alt_client, chat_id, topic_id, plan, chat_rule.no_media
+                        )
+                        if sent_msg_id:
+                            self._store.record_last_sent_message_for_scenario(
+                                scenario_id=scenario_id,
+                                chat_id=chat_id,
+                                topic_id=topic_id,
+                                account_id=alt_acc_id,
+                                last_msg_id=sent_msg_id,
+                            )
+                        failover_note = (
+                            f"Tự động đảo sang Nick #{alt_acc_id} do Nick #{account_id} gặp sự cố "
+                            f"({learned.reason_note or first_exc})"
+                        )
+                        return self._store.add_execution_log(
+                            category="auto_send",
+                            level="INFO",
+                            account_id=alt_acc_id,
+                            chat_id=chat_id,
+                            topic_id=topic_id,
+                            scenario_id=scenario_id,
+                            action_attempted=attempted_action,
+                            action_executed=plan.action_to_execute,
+                            fallback_applied=True,
+                            fallback_reason=failover_note,
+                            status="success",
+                            message=f"Đã gửi thành công tới {chat_id} nhờ Failover sang Nick #{alt_acc_id}",
+                        )
+                    except Exception as failover_exc:
+                        first_exc = failover_exc
+
+            # LAYER 2: Runtime Error Auto-Learn & Instant Fallback Retry
             if learned.learned_any_rule:
                 updated_rule = self._store.auto_learn_chat_restriction(
                     chat_id,
@@ -674,9 +802,9 @@ class AutoSenderEngine:
                 action_attempted=attempted_action,
                 action_executed=plan.action_to_execute,
                 fallback_applied=plan.fallback_applied,
-                fallback_reason=plan.fallback_reason_summary,
+                fallback_reason=learned.reason_note or plan.fallback_reason_summary,
                 status="failed",
-                message=f"Gửi thất bại tới nhóm {chat_id}: {first_exc}",
+                message=f"Gửi thất bại tới nhóm {chat_id}: {learned.reason_note or first_exc}",
             )
 
     async def _dispatch_plan_via_telethon(

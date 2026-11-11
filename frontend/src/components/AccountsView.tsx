@@ -42,12 +42,32 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
   const [inspectAcc, setInspectAcc] = useState<Account | null>(null);
   const [inspectGroups, setInspectGroups] = useState<ChatGroup[]>([]);
 
-  // Bulk Join & Clone Modal (Feature #4)
+  // Bulk Join & Clone Modal (Feature #4 + Smart Invite-First & Share Folder)
   const [bulkJoinAcc, setBulkJoinAcc] = useState<Account | null>(null);
   const [bulkLinksText, setBulkLinksText] = useState('');
   const [cloneFromAccId, setCloneFromAccId] = useState<string>('');
-  const [joinDelayMin, setJoinDelayMin] = useState(2);
-  const [joinDelayMax, setJoinDelayMax] = useState(5);
+  const [cloneStrategy, setCloneStrategy] = useState<'smart_auto' | 'invite_only' | 'share_folder'>(
+    'smart_auto',
+  );
+  const [createShareFolder, setCreateShareFolder] = useState(true);
+  const [maxSelfJoins, setMaxSelfJoins] = useState(8);
+  const [joinDelayMin, setJoinDelayMin] = useState(3);
+  const [joinDelayMax, setJoinDelayMax] = useState(7);
+  const [bulkJoinResult, setBulkJoinResult] = useState<{
+    account_label: string;
+    invited_by_source_count: number;
+    self_joined_count: number;
+    failed_count: number;
+    share_folder_link: string | null;
+    created_web_folder_name: string | null;
+    manual_join_links: {
+      chat_id: number | null;
+      title: string;
+      username: string | null;
+      join_link: string | null;
+      note: string;
+    }[];
+  } | null>(null);
 
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -136,8 +156,14 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
     setBusyId(acc.id);
     setErrorMsg(null);
     try {
-      await api.connectAccount(acc.id);
-      setStatusMsg(`Đã kiểm tra kết nối cho ${acc.label}`);
+      const updated = await api.connectAccount(acc.id);
+      if (updated.status !== 'connected') {
+        setErrorMsg(
+          `Tài khoản "${acc.label}" chưa đăng nhập hoặc phiên đã hết hạn (Trạng thái: ${updated.status.toUpperCase()}). Hãy bấm "Gửi OTP (Re-login)" để đăng nhập lại!`,
+        );
+      } else {
+        setStatusMsg(`Đã kết nối thành công cho "${acc.label}"`);
+      }
       onRefresh();
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Lỗi kết nối');
@@ -149,16 +175,25 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
   const handleHealthCheck = async (acc: Account) => {
     setBusyId(acc.id);
     setErrorMsg(null);
+    setStatusMsg(null);
     try {
       const h = await api.checkAccountHealth(acc.id);
-      setStatusMsg(
-        `[Health Check #${acc.id}] Trạng thái: ${h.status.toUpperCase()} | Ping: ${
-          h.latency_ms ?? '—'
-        }ms | Đã gửi: ${h.sent_last_hour}/${h.max_messages_per_hour} (1h), ${h.sent_last_24h}/${
-          h.max_messages_per_day
-        } (24h) | Số nhóm đã tham gia: ${h.joined_groups_count}`,
-      );
       onRefresh();
+      if (!h.authorized) {
+        setErrorMsg(
+          `[Health Check #${acc.id}] Phiên đăng nhập của "${acc.label}" đã hết hạn hoặc mất kết nối (${
+            h.error || 'Unauthorized'
+          }). Hệ thống đã tự động chuyển trạng thái sang ${h.status.toUpperCase()} — Hãy bấm nút "Gửi OTP (Re-login)" để đăng nhập lại!`,
+        );
+      } else {
+        setStatusMsg(
+          `[Health Check #${acc.id}] Trạng thái: ${h.status.toUpperCase()} | Ping: ${
+            h.latency_ms ?? '—'
+          }ms | Đã gửi: ${h.sent_last_hour}/${h.max_messages_per_hour} (1h), ${h.sent_last_24h}/${
+            h.max_messages_per_day
+          } (24h) | Số nhóm đã tham gia: ${h.joined_groups_count}`,
+        );
+      }
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Lỗi kiểm tra sức khỏe tài khoản');
     } finally {
@@ -221,13 +256,24 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
       const res = await api.bulkJoinGroups(bulkJoinAcc.id, {
         links_or_usernames: links,
         clone_from_account_id: cloneFromAccId ? Number(cloneFromAccId) : null,
-        delay_min_sec: Number(joinDelayMin) || 2,
-        delay_max_sec: Number(joinDelayMax) || 5,
+        clone_strategy: cloneStrategy,
+        create_share_folder: createShareFolder,
+        max_self_joins_per_run: Number(maxSelfJoins) || 8,
+        delay_min_sec: Number(joinDelayMin) || 3,
+        delay_max_sec: Number(joinDelayMax) || 7,
       });
       setStatusMsg(
-        `Bulk Join cho "${bulkJoinAcc.label}": Thành công ${res.joined_count}/${res.total_targets} nhóm (Lỗi: ${res.failed_count}).`,
+        `Bulk Join / Clone cho "${bulkJoinAcc.label}": Vào thành công ${res.joined_count} nhóm (Nick nguồn mời trực tiếp: ${res.invited_by_source_count}, Tự join: ${res.self_joined_count}) | Gói Link/Share Folder tự join thủ công: ${res.manual_pack_count} nhóm.`,
       );
-      setBulkJoinAcc(null);
+      setBulkJoinResult({
+        account_label: bulkJoinAcc.label,
+        invited_by_source_count: res.invited_by_source_count,
+        self_joined_count: res.self_joined_count,
+        failed_count: res.failed_count,
+        share_folder_link: res.share_folder_link,
+        created_web_folder_name: res.created_web_folder?.name || null,
+        manual_join_links: res.manual_join_links || [],
+      });
       setBulkLinksText('');
       onRefresh();
     } catch (err) {
@@ -494,7 +540,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
         </form>
       )}
 
-      {/* Bulk Join & Clone Modal (Feature #4) */}
+      {/* Bulk Join & Clone Modal (Feature #4 + Smart Invite-First & Share Folder) */}
       {bulkJoinAcc && (
         <form
           onSubmit={handleExecuteBulkJoin}
@@ -504,34 +550,49 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
             <h3 className="text-sm font-mono uppercase text-[#10B981] flex items-center gap-2">
               <UsersFour size={18} />
               <span>
-                Bulk Join & Nhân Bản Nhóm cho Nick #{bulkJoinAcc.id} ({bulkJoinAcc.label})
+                Bulk Join, Mời Trực Tiếp & Share Folder cho Nick #{bulkJoinAcc.id} ({bulkJoinAcc.label})
               </span>
             </h3>
             <button
               type="button"
-              onClick={() => setBulkJoinAcc(null)}
+              onClick={() => {
+                setBulkJoinAcc(null);
+                setBulkJoinResult(null);
+              }}
               className="text-xs font-mono text-[#A1A1AA] hover:text-white cursor-pointer"
             >
               [Đóng]
             </button>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-mono text-[#A1A1AA] mb-1">
-                Danh sách @username hoặc link t.me/+invite (Mỗi dòng 1 nhóm):
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-mono text-[#A1A1AA] mb-1">
+                  Danh sách @username hoặc link t.me/+invite (Mỗi dòng 1 nhóm):
+                </label>
+                <textarea
+                  rows={4}
+                  value={bulkLinksText}
+                  onChange={(e) => setBulkLinksText(e.target.value)}
+                  placeholder="@nhom_mua_ban_1&#10;https://t.me/+AbCdEfGhIjK&#10;t.me/kenh_tin_tuc"
+                  className="w-full px-3 py-2 text-xs font-mono"
+                />
+              </div>
+              <label className="flex items-center gap-2 text-xs font-mono text-[#F4F4F5] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={createShareFolder}
+                  onChange={(e) => setCreateShareFolder(e.target.checked)}
+                />
+                <span>
+                  Đồng thời tạo Share Folder (`t.me/addlist/...` + Folder Web) & Xuất danh sách Link mời để tự bấm Join thủ công
+                </span>
               </label>
-              <textarea
-                rows={4}
-                value={bulkLinksText}
-                onChange={(e) => setBulkLinksText(e.target.value)}
-                placeholder="@nhom_mua_ban_1&#10;https://t.me/+AbCdEfGhIjK&#10;t.me/kenh_tin_tuc"
-                className="w-full px-3 py-2 text-xs font-mono"
-              />
             </div>
             <div className="space-y-3">
               <div>
                 <label className="block text-xs font-mono text-[#A1A1AA] mb-1">
-                  Hoặc Clone (Sao chép) toàn bộ nhóm Public từ Tài khoản khác:
+                  Sao chép (Clone) nhóm từ Tài khoản nguồn:
                 </label>
                 <select
                   value={cloneFromAccId}
@@ -548,10 +609,47 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
                     ))}
                 </select>
               </div>
-              <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-mono text-[#A1A1AA] mb-1">
+                  Chiến lược chống Spam khi Clone từ Nick khác:
+                </label>
+                <select
+                  value={cloneStrategy}
+                  onChange={(e) =>
+                    setCloneStrategy(
+                      e.target.value as 'smart_auto' | 'invite_only' | 'share_folder',
+                    )
+                  }
+                  className="w-full px-3 py-2 text-xs font-mono"
+                >
+                  <option value="smart_auto">
+                    1. Thông minh (Ưu tiên Nick nguồn MỜI trực tiếp → Tự Join tối đa N nhóm → Dư tạo Share Folder)
+                  </option>
+                  <option value="invite_only">
+                    2. Chỉ dùng Nick nguồn MỜI trực tiếp + Xuất Share Folder / Link (Không tự bấm Join)
+                  </option>
+                  <option value="share_folder">
+                    3. Chỉ tạo Share Folder (t.me/addlist) & Danh sách Link mời để tự Join thủ công 100%
+                  </option>
+                </select>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
                 <div>
                   <label className="block text-xs font-mono text-[#A1A1AA] mb-1">
-                    Delay tối thiểu (giây)
+                    Tự Join tối đa
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={50}
+                    value={maxSelfJoins}
+                    onChange={(e) => setMaxSelfJoins(Number(e.target.value))}
+                    className="w-full px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-mono text-[#A1A1AA] mb-1">
+                    Delay min (s)
                   </label>
                   <input
                     type="number"
@@ -563,7 +661,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
                 </div>
                 <div>
                   <label className="block text-xs font-mono text-[#A1A1AA] mb-1">
-                    Delay tối đa (giây)
+                    Delay max (s)
                   </label>
                   <input
                     type="number"
@@ -579,10 +677,107 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
                 disabled={busyId === bulkJoinAcc.id}
                 className="w-full py-2 bg-[#10B981] text-[#052E16] font-bold text-xs font-mono uppercase cursor-pointer"
               >
-                {busyId === bulkJoinAcc.id ? 'Đang tham gia tuần tự...' : 'Bắt đầu Bulk Join'}
+                {busyId === bulkJoinAcc.id
+                  ? 'Đang xử lý mời nhóm & tạo Share Folder...'
+                  : 'Thực Thi Bulk Join / Mời Nhóm / Tạo Share Folder'}
               </button>
             </div>
           </div>
+
+          {/* Result Panel for Share Folder & Manual Join Links */}
+          {bulkJoinResult && (
+            <div className="p-4 border border-[#10B981] bg-[#09090B] space-y-3 text-xs font-mono">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[#10B981] font-bold">
+                  KẾT QUẢ CHO &quot;{bulkJoinResult.account_label}&quot;: Nick nguồn mời trực tiếp:{' '}
+                  {bulkJoinResult.invited_by_source_count} nhóm | Tự Join an toàn:{' '}
+                  {bulkJoinResult.self_joined_count} nhóm | Lỗi: {bulkJoinResult.failed_count}
+                </div>
+                {bulkJoinResult.created_web_folder_name && (
+                  <span className="px-2 py-0.5 border border-[#10B981] text-[#10B981]">
+                    Đã tạo Web Folder: {bulkJoinResult.created_web_folder_name}
+                  </span>
+                )}
+              </div>
+
+              {bulkJoinResult.share_folder_link && (
+                <div className="p-2.5 border border-[#F59E0B] bg-[#F59E0B]/10 text-[#F59E0B] flex items-center justify-between gap-2">
+                  <div>
+                    <strong>Link Share Folder Telegram (1-Click Addlist):</strong>{' '}
+                    <a
+                      href={bulkJoinResult.share_folder_link}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline"
+                    >
+                      {bulkJoinResult.share_folder_link}
+                    </a>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(bulkJoinResult.share_folder_link || '');
+                      setStatusMsg('Đã copy Link Share Folder vào Clipboard!');
+                    }}
+                    className="px-2.5 py-1 bg-[#F59E0B] text-[#09090B] font-bold cursor-pointer"
+                  >
+                    Copy Link Addlist
+                  </button>
+                </div>
+              )}
+
+              {bulkJoinResult.manual_join_links.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#A1A1AA]">
+                      Danh sách {bulkJoinResult.manual_join_links.length} nhóm còn lại để bạn tự Join thủ công (Tránh FloodWait 100%):
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const text = bulkJoinResult.manual_join_links
+                          .map((m) => m.join_link || `${m.title} (${m.chat_id})`)
+                          .join('\n');
+                        navigator.clipboard.writeText(text);
+                        setStatusMsg('Đã copy toàn bộ danh sách Link mời nhóm vào Clipboard!');
+                      }}
+                      className="px-2.5 py-1 border border-[#10B981] text-[#10B981] hover:bg-[#10B981]/15 cursor-pointer"
+                    >
+                      Copy Tất Cả Link Mời
+                    </button>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto border border-[#27272A] divide-y divide-[#27272A]">
+                    {bulkJoinResult.manual_join_links.map((item, idx) => (
+                      <div
+                        key={`${item.chat_id ?? idx}-${item.title}`}
+                        className="p-2 flex items-center justify-between gap-2"
+                      >
+                        <div>
+                          <span className="text-[#F4F4F5] font-semibold">{item.title}</span>{' '}
+                          {item.chat_id && (
+                            <span className="text-[#A1A1AA]">({item.chat_id})</span>
+                          )}
+                          <div className="text-[11px] text-[#A1A1AA]">{item.note}</div>
+                        </div>
+                        {item.join_link ? (
+                          <a
+                            href={item.join_link}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="px-2.5 py-1 border border-[#10B981] text-[#10B981] hover:bg-[#10B981]/15"
+                          >
+                            {item.join_link}
+                          </a>
+                        ) : (
+                          <span className="text-[#EF4444]">Nhóm kín (Không có link)</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </form>
       )}
 
@@ -730,7 +925,7 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
                       ) : (
                         <WarningCircle size={13} />
                       )}
-                      {acc.status.toUpperCase()}
+                      {acc.status === 'need_login' ? 'NEED_LOGIN (RE-LOGIN)' : acc.status.toUpperCase()}
                     </span>
                     {acc.last_error && (
                       <div className="text-[11px] text-[#EF4444] mt-1">{acc.last_error}</div>
@@ -738,17 +933,20 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
                   </td>
                   <td className="py-3 px-4 text-right">
                     <div className="inline-flex items-center gap-1.5 flex-wrap justify-end">
-                      {acc.status !== 'connected' && (
-                        <button
-                          type="button"
-                          disabled={busyId === acc.id}
-                          onClick={() => handleSendOtp(acc)}
-                          className="px-2 py-1 border border-[#F59E0B] text-[#F59E0B] hover:bg-[#F59E0B]/15 text-xs font-mono flex items-center gap-1 cursor-pointer"
-                        >
-                          <Key size={13} />
-                          <span>Gửi OTP</span>
-                        </button>
-                      )}
+                      <button
+                        type="button"
+                        disabled={busyId === acc.id}
+                        onClick={() => handleSendOtp(acc)}
+                        className={`px-2 py-1 border text-xs font-mono flex items-center gap-1 cursor-pointer ${
+                          acc.status !== 'connected'
+                            ? 'border-[#F59E0B] bg-[#F59E0B]/15 text-[#F59E0B] font-bold'
+                            : 'border-[#27272A] bg-[#18181C] hover:border-[#F59E0B] text-[#A1A1AA] hover:text-[#F59E0B]'
+                        }`}
+                        title="Gửi mã OTP để đăng nhập hoặc đăng nhập lại (Re-login)"
+                      >
+                        <Key size={13} />
+                        <span>{acc.status !== 'connected' ? 'Gửi OTP (Re-login)' : 'Re-login'}</span>
+                      </button>
                       <button
                         type="button"
                         disabled={busyId === acc.id}
@@ -791,7 +989,10 @@ export const AccountsView: React.FC<AccountsViewProps> = ({ accounts, onRefresh 
                       </button>
                       <button
                         type="button"
-                        onClick={() => setBulkJoinAcc(acc)}
+                        onClick={() => {
+                          setBulkJoinAcc(acc);
+                          setBulkJoinResult(null);
+                        }}
                         className="px-2 py-1 border border-[#27272A] bg-[#18181C] hover:border-[#10B981] text-xs font-mono flex items-center gap-1 cursor-pointer"
                         title="Tham gia nhiều nhóm hoặc Clone nhóm từ nick khác"
                       >

@@ -48,8 +48,12 @@ class AccountOtpVerifyRequest(BaseModel):
 class BulkJoinRequest(BaseModel):
     links_or_usernames: list[str] = Field(default_factory=list)
     clone_from_account_id: int | None = None
-    delay_min_sec: float = 2.0
-    delay_max_sec: float = 5.0
+    clone_strategy: Literal["smart_auto", "invite_only", "share_folder"] = "smart_auto"
+    create_share_folder: bool = True
+    share_folder_title: str | None = None
+    max_self_joins_per_run: int = Field(default=8, ge=0, le=50)
+    delay_min_sec: float = 3.0
+    delay_max_sec: float = 7.0
 
 
 class AccountMembershipModel(BaseModel):

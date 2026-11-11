@@ -154,6 +154,10 @@ async def bulk_join_groups(
             account_id,
             links_or_usernames=req.links_or_usernames,
             clone_from_account_id=req.clone_from_account_id,
+            clone_strategy=req.clone_strategy,
+            create_share_folder=req.create_share_folder,
+            share_folder_title=req.share_folder_title,
+            max_self_joins_per_run=req.max_self_joins_per_run,
             delay_min_sec=req.delay_min_sec,
             delay_max_sec=req.delay_max_sec,
         )
